@@ -160,6 +160,18 @@ class TestCommandTrigger(unittest.TestCase):
             CommandTrigger({"cmd": "true", "expected_rc": "abc"})
         self.assertIn("expected_rc", str(ctx.exception))
 
+    def test_expected_rc_above_255_raises(self):
+        """expected_rc=999 -> raises ValueError (Unix rc range is 0-255)."""
+        with self.assertRaises(ValueError) as ctx:
+            CommandTrigger({"cmd": "true", "expected_rc": 999})
+        self.assertIn("255", str(ctx.exception))
+
+    def test_expected_rc_negative_raises(self):
+        """expected_rc=-1 -> raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            CommandTrigger({"cmd": "true", "expected_rc": -1})
+        self.assertIn("expected_rc", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

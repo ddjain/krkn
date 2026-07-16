@@ -229,6 +229,22 @@ class TestTriggerManager(unittest.TestCase):
             TriggerManager(config)
         self.assertIn("conditions", str(ctx.exception))
 
+    def test_conditions_not_a_list_raises(self):
+        """conditions='some string' -> raises ValueError."""
+        config = _make_config(conditions="kubectl check something")
+        with self.assertRaises(ValueError) as ctx:
+            TriggerManager(config)
+        self.assertIn("list", str(ctx.exception))
+
+    def test_on_timeout_property(self):
+        """on_timeout property returns validated value."""
+        mock_build = patch.object(TriggerManager, "_build_trigger").start()
+        mock_build.return_value = StubTrigger(True)
+        config = _make_config(on_timeout="fail")
+        manager = TriggerManager(config)
+        self.assertEqual(manager.on_timeout, "fail")
+        patch.stopall()
+
     def test_unknown_trigger_type_raises(self):
         """type='kafka' -> raises ValueError."""
         config = _make_config(

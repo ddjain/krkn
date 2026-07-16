@@ -30,9 +30,15 @@ class TriggerManager:
     """Orchestrates polling across multiple triggers."""
 
     def __init__(self, trigger_config: dict):
-        if not trigger_config.get("conditions"):
+        conditions = trigger_config.get("conditions")
+        if not conditions:
             raise ValueError(
                 "trigger config must include a non-empty 'conditions' list"
+            )
+        if not isinstance(conditions, list):
+            raise ValueError(
+                "trigger 'conditions' must be a list, "
+                f"got {type(conditions).__name__}"
             )
 
         self._mode = trigger_config.get("mode", DEFAULT_MODE)
@@ -77,6 +83,10 @@ class TriggerManager:
 
         # Track per-trigger satisfaction state for get_status
         self._trigger_states: list[bool | None] = [None] * len(self._triggers)
+
+    @property
+    def on_timeout(self) -> str:
+        return self._on_timeout
 
     @staticmethod
     def _build_trigger(condition_config: dict) -> AbstractTrigger:

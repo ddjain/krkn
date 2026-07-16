@@ -34,6 +34,10 @@ class CommandTrigger(AbstractTrigger):
             raise ValueError(
                 f"expected_rc must be an integer, got {config.get('expected_rc')!r}"
             )
+        if not 0 <= self._expected_rc <= 255:
+            raise ValueError(
+                f"expected_rc must be between 0 and 255, got {self._expected_rc}"
+            )
         self._last_result: bool | None = None
 
     def evaluate(self) -> bool:

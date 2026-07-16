@@ -424,7 +424,7 @@ def main(options, command: Optional[str]) -> int:
                 )
                 triggered = trigger_manager.wait_for_triggers()
                 if not triggered:
-                    on_timeout = trigger_config.get("on_timeout", "skip")
+                    on_timeout = trigger_manager.on_timeout
                     if on_timeout == "skip":
                         logging.warning(
                             "trigger timed out, skipping all scenarios"
