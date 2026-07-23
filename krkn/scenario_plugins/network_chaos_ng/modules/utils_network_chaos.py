@@ -92,27 +92,6 @@ def namespaced_tc_commands(pids: list[str], commands: list[str]) -> list[str]:
     ]
 
 
-def get_egress_shaping_comand(
-    devices: list[str],
-    rate_mbit: Optional[str],
-    delay_ms: Optional[str],
-    loss_pct: Optional[str],
-) -> list[str]:
-
-    rate_commands = []
-    rate = _normalize_rate(rate_mbit)
-    d = _normalize_delay(delay_ms)
-    l = _normalize_loss(loss_pct)
-    for dev in devices:
-        rate_commands.append(
-            f"tc class change dev {dev} parent {ROOT_HANDLE} classid {CLASS_ID} htb rate {rate}"
-        )
-        rate_commands.append(
-            f"tc qdisc change dev {dev} parent {CLASS_ID} handle {NETEM_HANDLE} netem delay {d} loss {l}%"
-        )
-    return rate_commands
-
-
 def get_clear_egress_shaping_commands(devices: list[str]) -> list[str]:
     return [f"tc qdisc del dev {dev} root handle {ROOT_HANDLE}" for dev in devices]
 

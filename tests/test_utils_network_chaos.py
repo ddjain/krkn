@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch, call
 from krkn.scenario_plugins.network_chaos_ng.modules.utils_network_chaos import (
     get_build_tc_tree_commands,
     namespaced_tc_commands,
-    get_egress_shaping_comand,
     get_clear_egress_shaping_commands,
     get_ingress_shaping_commands,
     get_clear_ingress_shaping_commands,
@@ -190,67 +189,6 @@ class TestNamespacedTcCommands(unittest.TestCase):
         pids = ["1234", "5678"]
         commands = ["tc qdisc add dev eth0 root", "tc class add dev eth0"]
         result = namespaced_tc_commands(pids, commands)
-
-        self.assertEqual(len(result), 4)
-
-
-class TestEgressShapingCommands(unittest.TestCase):
-
-    def test_egress_shaping_with_all_params(self):
-        """
-        Test egress shaping commands with bandwidth, latency and loss
-        """
-        devices = ["eth0"]
-        result = get_egress_shaping_comand(devices, "100", "50", "10")
-
-        self.assertEqual(len(result), 2)
-        self.assertIn(
-            "tc class change dev eth0 parent 100: classid 100:1 htb rate 100mbit",
-            result,
-        )
-        self.assertIn(
-            "tc qdisc change dev eth0 parent 100:1 handle 101: netem delay 50ms loss 10%",
-            result,
-        )
-
-    def test_egress_shaping_with_defaults(self):
-        """
-        Test egress shaping commands with None values defaults to 1gbit, 0ms, 0%
-        """
-        devices = ["eth0"]
-        result = get_egress_shaping_comand(devices, None, None, None)
-
-        self.assertEqual(len(result), 2)
-        self.assertIn(
-            "tc class change dev eth0 parent 100: classid 100:1 htb rate 1gbit", result
-        )
-        self.assertIn(
-            "tc qdisc change dev eth0 parent 100:1 handle 101: netem delay 0ms loss 0%",
-            result,
-        )
-
-    def test_egress_shaping_with_suffixed_params(self):
-        """
-        Test that pre-suffixed values (e.g. "100mbit", "50ms", "10%") are passed through unchanged.
-        """
-        devices = ["eth0"]
-        result = get_egress_shaping_comand(devices, "100mbit", "50ms", "10%")
-
-        self.assertIn(
-            "tc class change dev eth0 parent 100: classid 100:1 htb rate 100mbit",
-            result,
-        )
-        self.assertIn(
-            "tc qdisc change dev eth0 parent 100:1 handle 101: netem delay 50ms loss 10%",
-            result,
-        )
-
-    def test_egress_shaping_multiple_interfaces(self):
-        """
-        Test egress shaping for multiple interfaces
-        """
-        devices = ["eth0", "eth1"]
-        result = get_egress_shaping_comand(devices, "100", "50", "10")
 
         self.assertEqual(len(result), 4)
 
