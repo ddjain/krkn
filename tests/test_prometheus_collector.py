@@ -556,7 +556,7 @@ class TestEvaluateSLOs(unittest.TestCase):
         self.assertTrue(results["slo_c"])
 
     def test_evaluate_slos_malformed_slo_dict(self):
-        """Test that a SLO dict missing required keys doesn't crash the entire evaluation."""
+        """Test that a SLO dict missing required keys is recorded as failed."""
         slo_list = [
             {"name": "good_slo", "expr": "good_query"},
             {"name": "no_expr_slo"},              # missing "expr"
@@ -577,6 +577,57 @@ class TestEvaluateSLOs(unittest.TestCase):
 
         self.assertTrue(results["good_slo"])
         self.assertTrue(results["another_good"])
+        # Malformed SLOs are recorded as failed
+        self.assertFalse(results["no_expr_slo"])
+        self.assertFalse(results["<unknown>"])
+
+    def test_evaluate_slos_zero_max_workers_clamped_to_one(self):
+        """Test that max_workers=0 is clamped to 1 instead of raising ValueError."""
+        slo_list = [
+            {"name": "slo_1", "expr": "query_1"},
+        ]
+
+        self.mock_prom_cli.process_prom_query_in_range.return_value = [
+            {"values": [[1234567890, "0"]]}
+        ]
+
+        with patch('krkn.prometheus.collector.ThreadPoolExecutor', wraps=ThreadPoolExecutor) as mock_pool:
+            results = evaluate_slos(
+                self.mock_prom_cli,
+                slo_list,
+                self.start_time,
+                self.end_time,
+                max_workers=0
+            )
+            mock_pool.assert_called_once_with(max_workers=1)
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results["slo_1"])
+
+    def test_evaluate_slos_negative_max_workers_clamped_to_one(self):
+        """Test that negative max_workers is clamped to 1."""
+        slo_list = [
+            {"name": "slo_a", "expr": "query_a"},
+            {"name": "slo_b", "expr": "query_b"},
+        ]
+
+        self.mock_prom_cli.process_prom_query_in_range.return_value = [
+            {"values": [[1234567890, "0"]]}
+        ]
+
+        with patch('krkn.prometheus.collector.ThreadPoolExecutor', wraps=ThreadPoolExecutor) as mock_pool:
+            results = evaluate_slos(
+                self.mock_prom_cli,
+                slo_list,
+                self.start_time,
+                self.end_time,
+                max_workers=-5
+            )
+            mock_pool.assert_called_once_with(max_workers=1)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results["slo_a"])
+        self.assertTrue(results["slo_b"])
 
 
 if __name__ == '__main__':
