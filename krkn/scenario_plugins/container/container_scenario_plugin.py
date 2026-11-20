@@ -90,7 +90,7 @@ class ContainerScenarioPlugin(AbstractScenarioPlugin):
         kill_action = get_yaml_item_value(cont_scenario, "action", 1)
         kill_count = get_yaml_item_value(cont_scenario, "count", 1)
         exclude_label = get_yaml_item_value(cont_scenario, "exclude_label", "")
-        if not isinstance(kill_action, int):
+        if isinstance(kill_action, bool) or not isinstance(kill_action, int):
             logging.error(
                 "Please make sure the action parameter defined in the "
                 "config is an integer"
@@ -99,6 +99,15 @@ class ContainerScenarioPlugin(AbstractScenarioPlugin):
         if (kill_action < 1) or (kill_action > 15):
             logging.error("Only 1-15 kill signals are supported.")
             raise RuntimeError()
+        if isinstance(kill_count, bool) or not isinstance(kill_count, int):
+            logging.error(
+                "Please make sure the count parameter defined in the "
+                "config is an integer"
+            )
+            raise RuntimeError("The count parameter must be an integer")
+        if kill_count < 1:
+            logging.error("The count parameter must be at least 1.")
+            raise RuntimeError("The count parameter must be at least 1")
         kill_action = "kill " + str(kill_action)
         if type(pod_names) != list:
             logging.error("Please make sure your pod_names are in a list format")
@@ -225,7 +234,7 @@ class ContainerScenarioPlugin(AbstractScenarioPlugin):
             i += 1
             # Blank response means it is done
             if not response:
-                break
+                return
             elif (
                 "unauthorized" in response.lower()
                 or "authorization" in response.lower()
@@ -236,13 +245,18 @@ class ContainerScenarioPlugin(AbstractScenarioPlugin):
                 logging.warning(response)
                 continue
 
+        raise RuntimeError(
+            "Failed to kill container %s in pod %s (ns %s) after %d attempts"
+            % (str(container_name), str(podname), str(namespace), i)
+        )
+
     def check_failed_containers(
         self, killed_container_list, wait_time, kubecli: KrknKubernetes
     ):
 
-        container_ready = []
         timer = 0
         while timer <= wait_time:
+            container_ready = []
             for killed_container in killed_container_list:
                 # pod namespace contain name
                 pod_output = kubecli.get_pod_info(
@@ -255,7 +269,7 @@ class ContainerScenarioPlugin(AbstractScenarioPlugin):
                             container_ready.append(killed_container)
             if len(container_ready) != 0:
                 for item in container_ready:
-                    killed_container_list = killed_container_list.remove(item)
+                    killed_container_list.remove(item)
             if killed_container_list is None or len(killed_container_list) == 0:
                 return []
             timer += 5

@@ -56,9 +56,17 @@ class PodDisruptionScenarioPlugin(AbstractScenarioPlugin):
                         kill_scenario_config,
                         lib_telemetry
                     )
-                    ret = self.killing_pods(
-                        kill_scenario_config, lib_telemetry.get_lib_kubernetes()
-                    )
+                    try:
+                        ret = self.killing_pods(
+                            kill_scenario_config, lib_telemetry.get_lib_kubernetes()
+                        )
+                    except Exception:
+                        logging.info("Cancelling pod monitoring future")
+                        future_snapshot.cancel()
+                        while not future_snapshot.done():
+                            logging.info("waiting for future to finish")
+                            time.sleep(1)
+                        raise
                     # returning 2 if configuration issue and exiting immediately
                     if ret > 1:
                         # Cancel the monitoring future since killing_pods already failed
@@ -221,8 +229,9 @@ class PodDisruptionScenarioPlugin(AbstractScenarioPlugin):
         # region Select target pods
         try:
             namespace = config.namespace_pattern
-            if not namespace: 
-                logging.error('Namespace pattern must be specified')
+            if not namespace:
+                logging.error('Namespace pattern must be specified (exit code: 2)')
+                return 2
 
             if config.kill < 0:
                 logging.error(
@@ -295,7 +304,7 @@ class PodDisruptionScenarioPlugin(AbstractScenarioPlugin):
             now_time = datetime.now()
 
             time_diff = now_time - start_time
-            if time_diff.seconds > wait_timeout:
+            if time_diff.total_seconds() > wait_timeout:
                 logging.error("timeout while waiting for pods to come up")
                 return 1
 

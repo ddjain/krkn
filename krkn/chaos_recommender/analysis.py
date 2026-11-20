@@ -157,17 +157,17 @@ def analysis_json(
     recommendations = {}
 
     if cpu_services:
-        cpu_recommend = {"services": cpu_services, "tests": chaos_tests_config["CPU"]}
+        cpu_recommend = {"services": cpu_services, "tests": chaos_tests_config.get("CPU", [])}
         recommendations["cpu_services_recommendations"] = cpu_recommend
 
     if mem_services:
-        mem_recommend = {"services": mem_services, "tests": chaos_tests_config["MEM"]}
+        mem_recommend = {"services": mem_services, "tests": chaos_tests_config.get("MEM", [])}
         recommendations["mem_services_recommendations"] = mem_recommend
 
     if outliers_network:
         outliers_network_recommend = {
             "outliers_networks": outliers_network,
-            "tests": chaos_tests_config["NETWORK"],
+            "tests": chaos_tests_config.get("NETWORK", []),
         }
         recommendations["outliers_network_recommendations"] = outliers_network_recommend
 

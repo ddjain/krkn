@@ -102,7 +102,9 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
         """Run only when at least one object-state check has a namespace."""
         checks = config.get("config", [])
         return any(
-            isinstance(check, dict) and str(check.get("namespace", "")).strip()
+            isinstance(check, dict)
+            and isinstance(check.get("namespace", ""), str)
+            and check.get("namespace", "").strip()
             for check in checks
         )
 
@@ -194,7 +196,8 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
                         # Kubernetes API object - convert to dict
                         try:
                             obj_dict = self.krkn_lib.api_client.sanitize_for_serialization(item)
-                            objects.append(obj_dict)
+                            if obj_dict is not None:
+                                objects.append(obj_dict)
                         except AttributeError:
                             # If sanitize_for_serialization fails, try vars() for dataclasses
                             try:
@@ -275,6 +278,9 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
                 except (TypeError, AttributeError) as e:
                     logging.error(f"Failed to convert object to dict: {e}")
                     return False, f"Failed to convert object to dict: {e}"
+        if not isinstance(obj, dict):
+            logging.error(f"Failed to convert object to dict: got {type(obj)}")
+            return False, f"Failed to convert object to dict: got {type(obj)}"
 
         kind = obj.get("kind", "Unknown")
         obj_name = obj.get("metadata", {}).get("name", "unknown")
@@ -319,7 +325,7 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
         object_name = check_config.get("object_name", None)
         namespace = check_config.get("namespace", "default")
         label_selector = check_config.get("label_selector", None)
-        condition = check_config.get("condition", {})
+        condition = check_config.get("condition") or {}
         condition_type = condition.get("type", "Ready")
         condition_status = condition.get("status", "True")
 
@@ -367,6 +373,8 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
                         failed_objects.append(f"{obj_namespace}/{obj_name}")
                     else:
                         failed_objects.append(obj_name)
+                else:
+                    failed_objects.append("unknown")
 
         # Message only contains names of failed objects
         message = "; ".join(failed_objects) if failed_objects else "All objects passed"
@@ -418,6 +426,9 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
         only_failures = config.get("only_failures", False)
 
         for check_config in config.get("config", []):
+            if not isinstance(check_config, dict):
+                logging.debug("Skipping non-dict object state check entry")
+                continue
             namespace = check_config.get("namespace", "default")
             if not isinstance(namespace, str) or not namespace.strip():
                 logging.debug(
@@ -435,7 +446,7 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
             if telemetry_queue is not None and (not only_failures or not result["passed"]):
                 start_dt = datetime.now()
                 cfg = check_config
-                condition = cfg.get("condition", {})
+                condition = cfg.get("condition") or {}
 
                 telemetry_record = {
                     "check_name": check_name,
@@ -498,7 +509,8 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
 
         check_configs = [
             cfg for cfg in config.get("config", [])
-            if isinstance(cfg.get("namespace", "default"), str)
+            if isinstance(cfg, dict)
+            and isinstance(cfg.get("namespace", "default"), str)
             and cfg.get("namespace", "default").strip()
         ]
         if len(check_configs) != len(config.get("config", [])):
@@ -514,14 +526,14 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
 
         # Track current status for each check
         status_tracker = {
-            cfg.get("name", f"check-{i}"): True
-            for i, cfg in enumerate(check_configs)
+            cfg.get("name", "unnamed-check"): True
+            for cfg in check_configs
         }
 
         # Store check configs by name for telemetry
         check_configs_by_name = {
-            cfg.get("name", f"check-{i}"): cfg
-            for i, cfg in enumerate(check_configs)
+            cfg.get("name", "unnamed-check"): cfg
+            for cfg in check_configs
         }
 
         while self.current_iterations < self.iterations and not self._stop_event.is_set():
@@ -555,7 +567,7 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
 
                         # Get check config details for telemetry
                         cfg = check_configs_by_name.get(check_name, {})
-                        condition = cfg.get("condition", {})
+                        condition = cfg.get("condition") or {}
 
                         # Record the status change period
                         change_record = {
@@ -608,7 +620,7 @@ class ObjectStateHealthCheckPlugin(AbstractHealthCheckPlugin):
 
             # Get check config details for telemetry
             cfg = check_configs_by_name.get(check_name, {})
-            condition = cfg.get("condition", {})
+            condition = cfg.get("condition") or {}
 
             final_record = {
                 "check_name": check_name,

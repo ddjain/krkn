@@ -57,6 +57,15 @@ class ServiceDisruptionScenarioPlugin(AbstractScenarioPlugin):
                                 "to blank ('') or label_selector to blank ('') to continue"
                             )
                             return 1
+                    if (
+                        scenario_namespace is None
+                        or scenario_namespace.strip() == ""
+                    ) and (scenario_label is None or scenario_label.strip() == ""):
+                        logging.error(
+                            "ServiceDisruptionScenarioPlugin Either namespace or "
+                            "label_selector must be set in your namespace scenario"
+                        )
+                        return 1
                     delete_count = get_yaml_item_value(scenario, "delete_count", 1)
                     run_count = get_yaml_item_value(scenario, "runs", 1)
                     run_sleep = get_yaml_item_value(scenario, "sleep", 10)
@@ -80,10 +89,10 @@ class ServiceDisruptionScenarioPlugin(AbstractScenarioPlugin):
                         for j in range(delete_count):
                             if len(namespaces) == 0:
                                 logging.error(
-                                    "ServiceDisruptionScenarioPlugin Couldn't delete %s namespaces, ù"
+                                    "ServiceDisruptionScenarioPlugin Couldn't delete %s namespaces, "
                                     "not enough namespaces matching %s with label %s"
                                     % (
-                                        str(run_count),
+                                        str(delete_count),
                                         scenario_namespace,
                                         str(scenario_label),
                                     )
@@ -122,6 +131,11 @@ class ServiceDisruptionScenarioPlugin(AbstractScenarioPlugin):
                                 % str(run_sleep)
                             )
                             time.sleep(run_sleep)
+                        self.check_all_running_deployment(
+                            killed_namespaces,
+                            wait_time,
+                            lib_telemetry.get_lib_kubernetes(),
+                        )
 
         except (Exception, RuntimeError) as e:
             logging.error(
@@ -278,9 +292,12 @@ class ServiceDisruptionScenarioPlugin(AbstractScenarioPlugin):
             pods_running = 0
             for pod in pod_list:
                 pod_info = kubecli.get_pod_info(pod, namespace_name)
-                if pod_info.status != "Running" and pod_info.status != "Succeeded":
+                if pod_info is None or (
+                    pod_info.status != "Running" and pod_info.status != "Succeeded"
+                ):
                     logging.info(
-                        "Pods %s still not running or completed" % pod_info.name
+                        "Pods %s still not running or completed"
+                        % (pod if pod_info is None else pod_info.name)
                     )
                     break
                 pods_running += 1

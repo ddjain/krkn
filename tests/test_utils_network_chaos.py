@@ -69,6 +69,99 @@ class TestNormalizers(unittest.TestCase):
         self.assertEqual(_normalize_loss(None), "0")
 
 
+class TestNormalizersEmptyStringDefect(unittest.TestCase):
+    """Regression / defect-documentation for empty-string tc silent failure.
+
+    When bandwidth/latency/loss are set to "" (empty string) in the scenario
+    YAML — common when the user only wants packet loss — the normalizers
+    returned "" instead of a valid default.  That produced invalid tc commands
+    (e.g. "htb rate " with no value, "loss %" with no number) which failed
+    silently; krkn reported success with no chaos injected.
+
+    Root Cause analysis: example/bug-network-chaos-empty-string-silent-failure.md
+    These tests document the *correct* (post-fix) contract: empty/whitespace
+    strings must be treated the same as None.
+    """
+
+    @unittest.expectedFailure
+    def test_normalize_rate_empty_string_returns_default(self):
+        self.assertEqual(_normalize_rate(""), "1gbit")
+
+    @unittest.expectedFailure
+    def test_normalize_delay_empty_string_returns_default(self):
+        self.assertEqual(_normalize_delay(""), "0ms")
+
+    @unittest.expectedFailure
+    def test_normalize_loss_empty_string_returns_zero(self):
+        self.assertEqual(_normalize_loss(""), "0")
+
+    @unittest.expectedFailure
+    def test_normalize_rate_whitespace_only_returns_default(self):
+        self.assertEqual(_normalize_rate("   "), "1gbit")
+        self.assertEqual(_normalize_rate("\t\n"), "1gbit")
+
+    @unittest.expectedFailure
+    def test_normalize_delay_whitespace_only_returns_default(self):
+        self.assertEqual(_normalize_delay("   "), "0ms")
+        self.assertEqual(_normalize_delay("\n"), "0ms")
+
+    @unittest.expectedFailure
+    def test_normalize_loss_whitespace_only_returns_zero(self):
+        self.assertEqual(_normalize_loss("   "), "0")
+
+    @unittest.expectedFailure
+    def test_normalize_loss_whitespace_with_percent(self):
+        self.assertEqual(_normalize_loss("  %"), "0")
+
+
+class TestBuildTcTreeWithEmptyStrings(unittest.TestCase):
+    """Ensure the high-level tc-tree builder also handles empty strings gracefully.
+
+    Before the fix, passing bandwidth/latency/loss = "" produced invalid fragments
+    like "htb rate " or "loss %".  These tests validate that the produced tc
+    commands never contain an empty/incomplete value and do contain the
+    expected defaults.
+    """
+
+    @unittest.expectedFailure
+    def test_empty_bandwidth_uses_default_rate(self):
+        cmds = get_build_tc_tree_commands(["eth0"], rate="", delay="10ms", loss="5")
+        # the htb rate command must contain a real rate value (1gbit default)
+        htb_cmd = [c for c in cmds if "htb rate" in c][0]
+        self.assertIn("1gbit", htb_cmd)
+        self.assertNotRegex(htb_cmd, r"rate\s*$")
+
+    @unittest.expectedFailure
+    def test_empty_latency_uses_default_delay(self):
+        cmds = get_build_tc_tree_commands(["eth0"], rate="100mbit", delay="", loss="5")
+        netem_cmd = [c for c in cmds if "netem" in c][0]
+        self.assertIn("0ms", netem_cmd)
+        self.assertNotIn("delay  ", netem_cmd)
+
+    @unittest.expectedFailure
+    def test_empty_loss_uses_zero(self):
+        cmds = get_build_tc_tree_commands(["eth0"], rate="100mbit", delay="10ms", loss="")
+        netem_cmd = [c for c in cmds if "netem" in c][0]
+        self.assertIn("loss 0%", netem_cmd)
+        self.assertNotIn("loss %", netem_cmd)
+
+    @unittest.expectedFailure
+    def test_all_empty_uses_all_defaults(self):
+        cmds = get_build_tc_tree_commands(["eth0"], rate="", delay="", loss="")
+        htb_cmd = [c for c in cmds if "htb rate" in c][0]
+        netem_cmd = [c for c in cmds if "netem" in c][0]
+        self.assertIn("1gbit", htb_cmd)
+        self.assertIn("0ms", netem_cmd)
+        self.assertIn("loss 0%", netem_cmd)
+
+    @unittest.expectedFailure
+    def test_none_and_empty_produce_same_output(self):
+        cmds_none = get_build_tc_tree_commands(["eth0"], rate=None, delay=None, loss=None)
+        cmds_empty = get_build_tc_tree_commands(["eth0"], rate="", delay="", loss="")
+        self.assertEqual(cmds_none, cmds_empty)
+
+
+
 class TestBuildTcTreeCommands(unittest.TestCase):
 
     def test_build_tc_tree_single_interface(self):

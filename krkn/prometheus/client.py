@@ -85,7 +85,7 @@ def critical_alerts(
             alert = ChaosRunAlert(alertname, alertstate, namespace, severity)
             summary.chaos_alerts.append(alert)
 
-    post_critical_alerts = prom_cli.process_query(query)
+    post_critical_alerts = prom_cli.process_query(query) or []
     for alert in post_critical_alerts:
         if "metric" in alert:
             alertname = (
@@ -149,13 +149,18 @@ def metrics(
     telemetry_json
 ) -> list[dict[str, list[(int, float)] | str]]:
    
-    if metrics_profile is None or os.path.exists(metrics_profile) is False:
+    if metrics_profile is None or os.path.isfile(metrics_profile) is False:
         logging.error(f"{metrics_profile} alert profile does not exist")
         sys.exit(1)
     with open(metrics_profile) as profile:
         profile_yaml = yaml.safe_load(profile)
 
-        if not profile_yaml["metrics"] or not isinstance(profile_yaml["metrics"], list):
+        if (
+            not isinstance(profile_yaml, dict)
+            or not profile_yaml.get("metrics")
+            or not isinstance(profile_yaml["metrics"], list)
+            or not all(isinstance(item, dict) for item in profile_yaml["metrics"])
+        ):
             logging.error(
                 f"{metrics_profile} wrong file format, alert profile must be "
                 f"a valid yaml file containing a list of items with 3 properties: "
@@ -166,6 +171,9 @@ def metrics(
         elapsed_time = str(elapsed_ceil) + "m"
         metrics_list: list[dict[str, int | float | str]] = []
         for metric_query in profile_yaml["metrics"]:
+            if "query" not in metric_query or "metricName" not in metric_query:
+                logging.info("metrics entry missing query or metricName, skipping")
+                continue
             query = metric_query['query']
             
             # calculate elapsed time
@@ -176,22 +184,24 @@ def metrics(
                    query
                 )
             elif (
-                sorted(metric_query.keys())
+                sorted(k for k in metric_query.keys() if k != "instant")
                 == sorted(["query", "metricName"])
             ):
                 metrics_result = prom_cli.process_prom_query_in_range(
                     query,
-                    start_time=datetime.datetime.fromtimestamp(start_time),
-                    end_time=datetime.datetime.fromtimestamp(end_time), granularity=30
+                    start_time=_as_prometheus_datetime(start_time),
+                    end_time=_as_prometheus_datetime(end_time), granularity=30
                 )
             else: 
                 logging.info("didn't match keys")
                 continue
             
             for returned_metric in metrics_result:
-                metric = {"query": query, "metricName": metric_query['metricName']}
-                for k,v in returned_metric['metric'].items():
-                    metric[k] = v
+                if "metric" not in returned_metric:
+                    continue
+                metric = dict(returned_metric['metric'])
+                metric["query"] = query
+                metric["metricName"] = metric_query['metricName']
                 
                 if "values" in returned_metric: 
                     for value in returned_metric["values"]:
@@ -200,7 +210,7 @@ def metrics(
                             metric["value"] = float(value[1])
                             # want double array of the known details and the metrics specific to each call                    
                             metrics_list.append(metric.copy())
-                        except ValueError:
+                        except (ValueError, TypeError):
                             pass
                 elif "value" in returned_metric:
                     try:
@@ -210,11 +220,11 @@ def metrics(
 
                         # want double array of the known details and the metrics specific to each call
                         metrics_list.append(metric.copy())
-                    except ValueError:
+                    except (ValueError, TypeError):
                         pass
         telemetry_json = json.loads(telemetry_json)
         for scenario in telemetry_json['scenarios']:
-            for k,v in scenario["affected_pods"].items():
+            for k,v in scenario.get("affected_pods", {}).items():
                 metric_name = "affected_pods_recovery"
                 metric = {"metricName": metric_name, "type": k}
                 if type(v) is list:
@@ -234,7 +244,7 @@ def metrics(
                             metric['timestamp'] = str(datetime.datetime.now())
                         logging.debug("adding vmi %s", metric)
                         metrics_list.append(metric.copy())
-            for affected_node in scenario["affected_nodes"]:
+            for affected_node in scenario.get("affected_nodes", []):
                 metric_name = "affected_nodes_recovery"
                 metric = {"metricName": metric_name}
                 for k,v in affected_node.items():
@@ -259,7 +269,7 @@ def metrics(
                     metrics_list.append(metric.copy())
 
         save_metrics = False
-        if elastic is not None and elastic_metrics_index is not None:
+        if elastic is not None and elastic_metrics_index:
             result = elastic.upload_metrics_to_elasticsearch(
                 run_uuid=run_uuid, index=elastic_metrics_index, raw_data=metrics_list
             )
@@ -271,7 +281,7 @@ def metrics(
         if save_metrics:
             local_dir = os.path.join(tempfile.gettempdir(), "krkn_metrics")
             os.makedirs(local_dir, exist_ok=True)
-            local_file = os.path.join(local_dir, f"{elastic_metrics_index}_{run_uuid}.json")
+            local_file = os.path.join(local_dir, f"{elastic_metrics_index or ''}_{run_uuid}.json")
 
             try:
                 with open(local_file, "w") as f:

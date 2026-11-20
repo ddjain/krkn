@@ -38,6 +38,8 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from krkn.health_checks import HealthCheckFactory, HealthCheckPluginNotFound
+from krkn_lib.models.telemetry.models import VirtCheck
+from datetime import datetime
 
 
 class TestVirtHealthCheckPlugin(unittest.TestCase):
@@ -1034,6 +1036,814 @@ class TestVirtHealthCheckPluginLabelSelector(unittest.TestCase):
         self.assertTrue(result)
         self.mock_kubecli.get_vmis.assert_called_once_with(
             ".*", "default", label_selector=None
+        )
+
+
+class TestVirtIsConfiguredAndThreads(unittest.TestCase):
+    """Tests for is_configured and manages_own_threads"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=1, krkn_lib=MagicMock()
+        )
+
+    def test_is_configured_non_empty_namespace_true(self):
+        """Test is_configured returns True for a non-empty namespace"""
+        self.assertTrue(self.plugin.is_configured({"namespace": "kubevirt"}))
+
+    def test_is_configured_whitespace_namespace_false(self):
+        """Test is_configured returns False for a whitespace-only namespace"""
+        self.assertFalse(self.plugin.is_configured({"namespace": "   "}))
+
+    def test_is_configured_key_absent_false(self):
+        """Test is_configured returns False when namespace key is absent"""
+        self.assertFalse(self.plugin.is_configured({}))
+
+    def test_is_configured_none_namespace_false(self):
+        """Test is_configured returns False when namespace is explicitly None"""
+        # correct behaviour: None means not configured, consistent with the
+        # namespace == "" gate in _initialize_from_config
+        self.assertFalse(self.plugin.is_configured({"namespace": None}))
+
+    def test_manages_own_threads_true(self):
+        """Test manages_own_threads returns True so factory does not wrap run_health_check"""
+        self.assertTrue(self.plugin.manages_own_threads())
+
+
+class TestVirtCheckVmiReady(unittest.TestCase):
+    """Tests for check_vmi_ready"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.mock_kubecli = MagicMock()
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=1, krkn_lib=self.mock_kubecli
+        )
+
+    @staticmethod
+    def _vmi(phase="Running", conditions=None):
+        status = {"phase": phase}
+        if conditions is not None:
+            status["conditions"] = conditions
+        return {"metadata": {"name": "vm1", "namespace": "default"}, "status": status}
+
+    def test_check_vmi_ready_vmi_gone_false(self):
+        """Test check_vmi_ready returns False when the VMI no longer exists"""
+        self.mock_kubecli.get_vmi.return_value = None
+        self.assertFalse(self.plugin.check_vmi_ready("vm1", "default"))
+        self.mock_kubecli.get_vmi.assert_called_once_with("vm1", "default")
+
+    def test_check_vmi_ready_running_ready_true(self):
+        """Test check_vmi_ready returns True for Running phase with Ready=True"""
+        self.mock_kubecli.get_vmi.return_value = self._vmi(
+            conditions=[{"type": "Ready", "status": "True"}]
+        )
+        self.assertTrue(self.plugin.check_vmi_ready("vm1", "default"))
+
+    def test_check_vmi_ready_running_ready_false(self):
+        """Test check_vmi_ready returns False when Ready condition is False"""
+        self.mock_kubecli.get_vmi.return_value = self._vmi(
+            conditions=[{"type": "Ready", "status": "False"}]
+        )
+        self.assertFalse(self.plugin.check_vmi_ready("vm1", "default"))
+
+    def test_check_vmi_ready_running_unrelated_condition_false(self):
+        """Test check_vmi_ready returns False when only unrelated conditions exist"""
+        self.mock_kubecli.get_vmi.return_value = self._vmi(
+            conditions=[{"type": "LiveMigratable", "status": "True"}]
+        )
+        self.assertFalse(self.plugin.check_vmi_ready("vm1", "default"))
+
+    def test_check_vmi_ready_running_no_conditions_key_false(self):
+        """Test check_vmi_ready returns False without raising when conditions key is absent"""
+        self.mock_kubecli.get_vmi.return_value = self._vmi()
+        self.assertFalse(self.plugin.check_vmi_ready("vm1", "default"))
+
+    def test_check_vmi_ready_api_exception_false_logged(self):
+        """Test check_vmi_ready returns False and logs when the API raises"""
+        self.mock_kubecli.get_vmi.side_effect = Exception("api down")
+        with self.assertLogs(level="ERROR") as logs:
+            self.assertFalse(self.plugin.check_vmi_ready("vm1", "default"))
+        self.assertTrue(any("vm1" in line for line in logs.output))
+
+    def test_check_vmi_ready_not_running_phase_false(self):
+        """Test check_vmi_ready returns False for a non-Running phase"""
+        self.mock_kubecli.get_vmi.return_value = self._vmi(phase="Pending")
+        self.assertFalse(self.plugin.check_vmi_ready("vm1", "default"))
+
+
+class TestVirtBatchRunnerGaps(unittest.TestCase):
+    """Tests for _run_virt_check_batch edge paths"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=2, krkn_lib=MagicMock()
+        )
+        self.plugin.disconnected = False
+        self.plugin.only_failures = False
+
+    @staticmethod
+    def _mock_vm(name="vm1"):
+        vm = MagicMock()
+        vm.vm_name = name
+        vm.namespace = "default"
+        vm.ip_address = "10.0.0.1"
+        vm.node_name = "worker-1"
+        vm.new_ip_address = ""
+        return vm
+
+    @patch("krkn.health_checks.virt_health_check_plugin.time.sleep")
+    def test_run_virt_check_batch_stamps_new_ip_into_closed_segment(self, mock_sleep):
+        """Test a discovered new IP is stamped into the closed tracker segment on status change"""
+        # CHARACTERIZATION: the new IP is stamped retroactively onto the tracker segment
+        # closed at the status flip (_run_virt_check_batch sets it on the old entry), and
+        # the reopened segment picks it up from vm.new_ip_address on creation.
+        vm = self._mock_vm()
+        ssh_values = [True, False]
+        ssh_idx = [0]
+        sleep_count = [0]
+
+        def flip_then_stop(*_):
+            sleep_count[0] += 1
+            if sleep_count[0] == 1:
+                # between pass 1 and pass 2: VM restarts elsewhere with a new IP
+                vm.new_ip_address = "10.0.0.9"
+            else:
+                self.plugin.current_iterations = self.plugin.iterations
+
+        mock_sleep.side_effect = flip_then_stop
+
+        def next_ssh(*_):
+            val = ssh_values[ssh_idx[0] % len(ssh_values)]
+            ssh_idx[0] += 1
+            return val
+
+        with patch.object(self.plugin, "get_vm_access", side_effect=next_ssh), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True):
+            telemetry_queue = queue.SimpleQueue()
+            self.plugin._run_virt_check_batch([vm], telemetry_queue)
+
+        result = telemetry_queue.get_nowait()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].new_ip_address, "10.0.0.9")
+        self.assertTrue(result[0].ssh_status)
+        self.assertEqual(result[1].new_ip_address, "10.0.0.9")
+
+    def test_run_virt_check_batch_queue_put_error_logged(self):
+        """Test _run_virt_check_batch returns cleanly when queue.put raises"""
+        # CHARACTERIZATION: queue.put errors are swallowed here but not in _run_post_virt_check
+
+        class FailingQueue(queue.SimpleQueue):
+            def put(self, *args, **kwargs):
+                raise RuntimeError("queue closed")
+
+        vm = self._mock_vm()
+        self.plugin.current_iterations = self.plugin.iterations
+        with patch.object(self.plugin, "get_vm_access", return_value=True), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True), \
+             self.assertLogs("root", level="ERROR") as logs:
+            self.plugin._run_virt_check_batch([vm], FailingQueue())
+        self.assertTrue(any("Put queue error" in line for line in logs.output))
+
+    def test_run_virt_check_batch_stop_event_skips_probes(self):
+        """Test a preset stop_event exits the loop before probing any VM"""
+        vm = self._mock_vm()
+        self.plugin.stop()
+        telemetry_queue = queue.SimpleQueue()
+        with patch.object(self.plugin, "_get_ssh_status") as mock_ssh, \
+             patch.object(self.plugin, "check_vmi_ready") as mock_ready:
+            self.plugin._run_virt_check_batch([vm], telemetry_queue)
+        mock_ssh.assert_not_called()
+        mock_ready.assert_not_called()
+        self.assertEqual(telemetry_queue.get_nowait(), [])
+
+
+class TestVirtGatherPostChecks(unittest.TestCase):
+    """Tests for gather_post_virt_checks thread path"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=1, krkn_lib=MagicMock()
+        )
+
+    @staticmethod
+    def _mock_vm(name):
+        vm = MagicMock()
+        vm.vm_name = name
+        vm.namespace = "default"
+        vm.ip_address = "10.0.0.1"
+        vm.node_name = "worker-1"
+        vm.new_ip_address = ""
+        return vm
+
+    def _fake_post_check(self):
+        def fake_post_check(vm_batch, virt_telemetry, post_queue):
+            post_queue.put([f"entry-{vm_batch[0].vm_name}"])
+
+        return fake_post_check
+
+    def test_gather_post_virt_checks_thread_path_drains_queue(self):
+        """Test the thread path merges per-batch results and discards the input telemetry"""
+        self.plugin.vm_list = [self._mock_vm("vm1"), self._mock_vm("vm2")]
+        self.plugin.batch_size = 1
+        self.plugin.exit_on_failure = False
+
+        with patch.object(self.plugin, "_run_post_virt_check",
+                          side_effect=self._fake_post_check()):
+            result = self.plugin.gather_post_virt_checks(["stale"])
+
+        self.assertEqual(sorted(result), ["entry-vm1", "entry-vm2"])
+        self.assertEqual(self.plugin.get_return_value(), 0)
+
+    def test_gather_post_virt_checks_multi_batch_merge(self):
+        """Test all batches' entries are merged into the result"""
+        self.plugin.vm_list = [self._mock_vm(f"vm{i}") for i in range(5)]
+        self.plugin.batch_size = 2  # 3 batches: 2 + 2 + 1 VMs
+        self.plugin.exit_on_failure = False
+
+        with patch.object(self.plugin, "_run_post_virt_check",
+                          side_effect=self._fake_post_check()):
+            result = self.plugin.gather_post_virt_checks([])
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(
+            sorted(result),
+            ["entry-vm0", "entry-vm2", "entry-vm4"],
+        )
+
+    def test_gather_post_virt_checks_exit_on_failure_via_batch(self):
+        """Test exit_on_failure sets ret_value when queued entries exist"""
+        failing = VirtCheck(
+            {
+                "vm_name": "vm1", "ip_address": "10.0.0.1", "namespace": "default",
+                "node_name": "worker-1", "ssh_status": False, "vmi_ready": True,
+                "status": False, "check_type": "ssh_access",
+                "start_timestamp": "t", "end_timestamp": "t", "duration": 0,
+                "new_ip_address": "", "phase": "post",
+            }
+        )
+
+        def fake_post_check(vm_batch, virt_telemetry, post_queue):
+            post_queue.put([failing])
+
+        self.plugin.vm_list = [self._mock_vm("vm1")]
+        self.plugin.batch_size = 1
+        self.plugin.exit_on_failure = True
+
+        with patch.object(self.plugin, "_run_post_virt_check", side_effect=fake_post_check):
+            result = self.plugin.gather_post_virt_checks([])
+
+        self.assertEqual(result, [failing])
+        self.assertEqual(self.plugin.get_return_value(), 3)
+
+    def test_gather_post_virt_checks_exit_on_failure_all_healthy(self):
+        """Test ret_value stays 0 when every batch reports no failures"""
+
+        def fake_post_check(vm_batch, virt_telemetry, post_queue):
+            post_queue.put([])
+
+        self.plugin.vm_list = [self._mock_vm("vm1"), self._mock_vm("vm2")]
+        self.plugin.batch_size = 1
+        self.plugin.exit_on_failure = True
+
+        with patch.object(self.plugin, "_run_post_virt_check", side_effect=fake_post_check):
+            result = self.plugin.gather_post_virt_checks([])
+
+        self.assertEqual(result, [])
+        self.assertEqual(self.plugin.get_return_value(), 0)
+
+    def test_run_post_virt_check_queue_put_error_propagates(self):
+        """Test _run_post_virt_check lets a queue.put error escape to the caller"""
+        # CHARACTERIZATION: unlike _run_virt_check_batch, the put here is not guarded,
+        # so a queue error propagates out of _run_post_virt_check.
+        class FailingQueue(queue.SimpleQueue):
+            def put(self, *args, **kwargs):
+                raise RuntimeError("queue closed")
+
+        with patch.object(self.plugin, "_get_ssh_status", return_value=False), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "queue closed"):
+                self.plugin._run_post_virt_check([self._mock_vm("vm1")], [], FailingQueue())
+
+
+class TestVirtPostCheckProbeFailure(unittest.TestCase):
+    """Tests for _run_post_virt_check SSH probe failure handling"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=1, krkn_lib=MagicMock()
+        )
+        self.plugin.disconnected = False
+        vm = MagicMock()
+        vm.vm_name = "vm-probe-err"
+        vm.namespace = "default"
+        vm.ip_address = "10.0.0.1"
+        vm.node_name = "worker-1"
+        vm.new_ip_address = ""
+        self.vm = vm
+
+    def test_run_post_virt_check_probe_exception_recorded_as_failure(self):
+        """Test an SSH probe exception yields a failing ssh_access entry without propagating"""
+        with patch.object(self.plugin, "get_vm_access",
+                          side_effect=Exception("probe boom")), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True):
+            result_queue = queue.SimpleQueue()
+            self.plugin._run_post_virt_check([self.vm], [], result_queue)
+
+        result = result_queue.get_nowait()
+        self.assertEqual(len(result), 1)
+        self.assertFalse(result[0].ssh_status)
+        self.assertTrue(result[0].vmi_ready)
+        self.assertEqual(result[0].check_type, "ssh_access")
+        self.assertFalse(result[0].status)
+
+    def test_run_post_virt_check_probe_exception_logged(self):
+        """Test an SSH probe exception in the post-check is logged like the during-check path"""
+        # correct behaviour: observability parity with _run_virt_check_batch,
+        # which logs probe exceptions via logging.exception
+        with patch.object(self.plugin, "get_vm_access",
+                          side_effect=Exception("probe boom")), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True), \
+             self.assertLogs(level="ERROR"):
+            self.plugin._run_post_virt_check([self.vm], [], queue.SimpleQueue())
+
+
+class TestVirtRunOnce(unittest.TestCase):
+    """Tests for run_once"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.mock_kubecli = MagicMock()
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=1, krkn_lib=self.mock_kubecli
+        )
+
+    @staticmethod
+    def _vmi(name, namespace="default", ip="10.0.0.1", node="worker-1"):
+        return {
+            "metadata": {"name": name, "namespace": namespace},
+            "status": {"nodeName": node, "interfaces": [{"ipAddress": ip}]},
+        }
+
+    def _patch_vmi_listing(self, vmis):
+        """Patch the VMI outage plugin so run_once lists the given VMIs"""
+        patcher = patch(
+            "krkn.health_checks.virt_health_check_plugin.VmiOutageScenarioPlugin"
+        )
+        mock_plugin_class = patcher.start()
+        self.addCleanup(patcher.stop)
+        mock_plugin = MagicMock()
+        mock_plugin_class.return_value = mock_plugin
+        mock_plugin.k8s_client = self.mock_kubecli
+        self.mock_kubecli.get_vmis.return_value = vmis
+        return mock_plugin_class
+
+    def _checks(self, ssh=True, vmi=True):
+        """Patch SSH and VMI readiness probes with the given results"""
+        for patcher in (
+            patch.object(self.plugin, "_get_ssh_status", return_value=ssh),
+            patch.object(self.plugin, "check_vmi_ready", return_value=vmi),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_run_once_falsy_config_returns_skip(self):
+        """Test run_once returns the skip result and touches no queue for falsy config"""
+        for config in (None, {}):
+            with self.subTest(config=config):
+                telemetry_queue = queue.Queue()
+                result = self.plugin.run_once(config, telemetry_queue)
+                self.assertEqual(
+                    result, {"passed": True, "failures": [], "details": {}}
+                )
+                self.assertTrue(telemetry_queue.empty())
+
+    def test_run_once_empty_namespace_returns_skip(self):
+        """Test run_once skips initialization when namespace is not configured"""
+        telemetry_queue = queue.Queue()
+        result = self.plugin.run_once({"namespace": ""}, telemetry_queue)
+        self.assertEqual(result, {"passed": True, "failures": [], "details": {}})
+        self.assertTrue(telemetry_queue.empty())
+        self.assertEqual(self.plugin.vm_list, [])
+
+    def test_run_once_builds_vm_list_from_config(self):
+        """Test run_once builds the VM list from the config-driven VMI listing"""
+        self._patch_vmi_listing([self._vmi("vm1"), self._vmi("vm2")])
+        self._checks()
+        result = self.plugin.run_once({"namespace": "default"})
+        self.assertEqual(len(self.plugin.vm_list), 2)
+        self.assertEqual(
+            sorted(result["details"].keys()), ["default/vm1", "default/vm2"]
+        )
+
+    def test_run_once_all_healthy_no_queue(self):
+        """Test run_once passes with per-VM details when both checks succeed"""
+        self._patch_vmi_listing([self._vmi("vm1"), self._vmi("vm2", ip="10.0.0.2")])
+        self._checks(ssh=True, vmi=True)
+        result = self.plugin.run_once({"namespace": "default"})
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(sorted(result["details"].keys()), ["default/vm1", "default/vm2"])
+        for key, entry in result["details"].items():
+            with self.subTest(vm=key):
+                self.assertTrue(entry["passed"])
+                self.assertTrue(entry["ssh_status"])
+                self.assertTrue(entry["vmi_ready"])
+                self.assertEqual(entry["node_name"], "worker-1")
+        self.assertEqual(result["details"]["default/vm2"]["ip_address"], "10.0.0.2")
+
+    def test_run_once_both_checks_fail(self):
+        """Test run_once reports both SSH and VMI failures for one VM"""
+        self._patch_vmi_listing([self._vmi("vm1")])
+        self._checks(ssh=False, vmi=False)
+        result = self.plugin.run_once({"namespace": "default"})
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["vm_name"], "vm1")
+        self.assertFalse(failure["ssh_status"])
+        self.assertFalse(failure["vmi_ready"])
+        self.assertIn("SSH access failed", failure["message"])
+        self.assertIn("VMI not ready", failure["message"])
+        self.assertFalse(result["details"]["default/vm1"]["passed"])
+
+    def test_run_once_vmi_only_failure(self):
+        """Test run_once failure message names only the failing check"""
+        self._patch_vmi_listing([self._vmi("vm1")])
+        self._checks(ssh=True, vmi=False)
+        result = self.plugin.run_once({"namespace": "default"})
+        self.assertFalse(result["passed"])
+        message = result["failures"][0]["message"]
+        self.assertIn("VMI not ready", message)
+        self.assertNotIn("SSH access failed", message)
+        self.assertTrue(result["failures"][0]["ssh_status"])
+
+    def test_run_once_ssh_probe_exception_no_propagation(self):
+        """Test an SSH probe exception is caught and recorded as an SSH failure"""
+        self._patch_vmi_listing([self._vmi("vm1")])
+        self._checks(ssh=True, vmi=True)
+        with patch.object(self.plugin, "_get_ssh_status",
+                          side_effect=Exception("probe boom")):
+            result = self.plugin.run_once({"namespace": "default"})
+        entry = result["details"]["default/vm1"]
+        self.assertFalse(entry["ssh_status"])
+        self.assertTrue(entry["vmi_ready"])
+        self.assertFalse(entry["passed"])
+        self.assertIn("SSH access failed", result["failures"][0]["message"])
+
+    def test_run_once_empty_vm_list(self):
+        """Test run_once passes with empty details when no VMIs are listed"""
+        self._patch_vmi_listing([])
+        self._checks()
+        telemetry_queue = queue.Queue()
+        result = self.plugin.run_once({"namespace": "default"}, telemetry_queue)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["details"], {})
+        self.assertEqual(result["failures"], [])
+        self.assertTrue(telemetry_queue.empty())
+
+    def test_run_once_telemetry_record_shape(self):
+        """Test run_once enqueues one list of VirtCheck records with correct fields"""
+        self._patch_vmi_listing([self._vmi("vm-ok"), self._vmi("vm-bad")])
+        self._checks(ssh=True, vmi=True)
+        with patch.object(self.plugin, "_get_ssh_status",
+                          side_effect=[True, False]):
+            telemetry_queue = queue.Queue()
+            result = self.plugin.run_once(
+                {"namespace": "default"}, telemetry_queue, phase="post"
+            )
+        self.assertFalse(result["passed"])
+        records = telemetry_queue.get_nowait()
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(isinstance(r, VirtCheck) for r in records))
+        failing = next(r for r in records if r.vm_name == "vm-bad")
+        self.assertFalse(failing.status)
+        self.assertFalse(failing.ssh_status)
+        self.assertTrue(failing.vmi_ready)
+        self.assertEqual(failing.check_type, "ssh_access")
+        self.assertEqual(failing.phase, "post")
+        self.assertGreaterEqual(failing.duration, 0)
+        self.assertIsInstance(failing.duration, float)
+        datetime.fromisoformat(failing.start_timestamp)
+        datetime.fromisoformat(failing.end_timestamp)
+
+    def test_run_once_phase_param_honored(self):
+        """Test the phase argument is stamped onto telemetry records"""
+        for phase in ("pre", "post"):
+            with self.subTest(phase=phase):
+                plugin = self.factory.create_plugin(
+                    "virt_health_check", iterations=1, krkn_lib=MagicMock()
+                )
+                self._patch_vmi_listing([self._vmi("vm1")])
+                with patch.object(plugin, "_get_ssh_status", return_value=True), \
+                     patch.object(plugin, "check_vmi_ready", return_value=True):
+                    telemetry_queue = queue.Queue()
+                    plugin.run_once({"namespace": "default"}, telemetry_queue, phase=phase)
+                self.assertEqual(telemetry_queue.get_nowait()[0].phase, phase)
+
+    def test_run_once_default_phase_is_during(self):
+        """Test telemetry records default to the 'during' phase"""
+        self._patch_vmi_listing([self._vmi("vm1")])
+        self._checks()
+        telemetry_queue = queue.Queue()
+        self.plugin.run_once({"namespace": "default"}, telemetry_queue)
+        self.assertEqual(telemetry_queue.get_nowait()[0].phase, "during")
+
+    def test_run_once_only_failures_filters_records(self):
+        """Test only_failures enqueues only failing records"""
+        self._patch_vmi_listing([self._vmi("vm-ok"), self._vmi("vm-bad")])
+        self._checks(ssh=True, vmi=True)
+        with patch.object(self.plugin, "_get_ssh_status",
+                          side_effect=[True, False]):
+            telemetry_queue = queue.Queue()
+            self.plugin.run_once(
+                {"namespace": "default", "only_failures": True}, telemetry_queue
+            )
+        records = telemetry_queue.get_nowait()
+        self.assertEqual([r.vm_name for r in records], ["vm-bad"])
+
+    def test_run_once_only_failures_all_pass_no_put(self):
+        """Test only_failures enqueues nothing when all VMs pass"""
+        self._patch_vmi_listing([self._vmi("vm1")])
+        self._checks()
+        telemetry_queue = queue.Queue()
+        result = self.plugin.run_once(
+            {"namespace": "default", "only_failures": True}, telemetry_queue
+        )
+        self.assertTrue(result["passed"])
+        self.assertTrue(telemetry_queue.empty())
+
+    def test_run_once_new_ip_carried_into_record(self):
+        """Test a new IP discovered during the probe is carried into the telemetry record"""
+        self._patch_vmi_listing([self._vmi("vm1")])
+        self._checks()
+
+        def probe_and_migrate(vm):
+            vm.new_ip_address = "10.0.0.9"
+            return True
+
+        telemetry_queue = queue.Queue()
+        with patch.object(self.plugin, "_get_ssh_status",
+                          side_effect=probe_and_migrate):
+            self.plugin.run_once({"namespace": "default"}, telemetry_queue)
+        records = telemetry_queue.get_nowait()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].new_ip_address, "10.0.0.9")
+
+    def test_run_once_namespace_qualified_detail_keys(self):
+        """Test VMs with the same name in different namespaces get distinct detail keys"""
+        self._patch_vmi_listing(
+            [self._vmi("vm1", namespace="ns1"), self._vmi("vm1", namespace="ns2")]
+        )
+        self._checks()
+        result = self.plugin.run_once({"namespace": "ns1"})
+        self.assertEqual(sorted(result["details"].keys()), ["ns1/vm1", "ns2/vm1"])
+
+    def test_run_once_init_api_exception_fails(self):
+        """Test run_once does not report a pass when initialization hits a cluster error"""
+        # correct behaviour: a failed initialization (e.g. get_vmis API error)
+        # must not silently report a passing health check for pre/post phases
+        with patch(
+            "krkn.health_checks.virt_health_check_plugin.VmiOutageScenarioPlugin"
+        ) as mock_plugin_class:
+            mock_plugin_class.side_effect = Exception("api down")
+            result = self.plugin.run_once({"namespace": "default"})
+        self.assertFalse(result["passed"])
+
+    def test_run_once_telemetry_duration_is_per_vm(self):
+        """Test each VM's telemetry duration reflects only its own probe time"""
+        from datetime import timedelta
+
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        # Fake clock in whole seconds, advanced only by the probes, so the result
+        # does not depend on how many datetime.now() calls production makes.
+        clock = [0]
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return base + timedelta(seconds=clock[0])
+
+        def probe(vm):
+            clock[0] += 1
+            return True
+
+        self._patch_vmi_listing([self._vmi("vm1"), self._vmi("vm2")])
+        telemetry_queue = queue.Queue()
+        with patch(
+            "krkn.health_checks.virt_health_check_plugin.datetime", FakeDatetime
+        ), patch.object(self.plugin, "_get_ssh_status", side_effect=probe), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True):
+            self.plugin.run_once({"namespace": "default"}, telemetry_queue)
+        records = telemetry_queue.get_nowait()
+        self.assertEqual(len(records), 2)
+        for record in records:
+            with self.subTest(vm=record.vm_name):
+                self.assertEqual(record.duration, 1.0)
+
+    def test_run_once_second_call_does_not_duplicate_vms(self):
+        """Test a second run_once on the same instance does not re-report the same VMs"""
+        self._patch_vmi_listing([self._vmi("vm1"), self._vmi("vm2")])
+        self._checks()
+        self.plugin.run_once({"namespace": "default"}, queue.Queue())
+        second_queue = queue.Queue()
+        result = self.plugin.run_once({"namespace": "default"}, second_queue)
+        self.assertEqual(sorted(result["details"].keys()), ["default/vm1", "default/vm2"])
+        self.assertEqual(len(second_queue.get_nowait()), 2)
+
+
+class TestVirtDisconnectedAccessNoneIp(unittest.TestCase):
+    """Tests guarding against probing root@None when the VMI lost its interfaces"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=1, krkn_lib=MagicMock()
+        )
+        self.plugin.namespace = "default"
+        self.plugin.ssh_node = ""
+        mock_vm_plugin = MagicMock()
+        self.plugin.kube_vm_plugin = mock_vm_plugin
+        self.mock_vm_plugin = mock_vm_plugin
+
+    def test_check_disconnected_access_skips_probe_when_new_ip_none(self):
+        """Test no new-IP probe runs when the restarted VMI has no interfaces"""
+        # correct behaviour: skip the new-IP probe when new_ip_address is None
+        self.mock_vm_plugin.get_vmi.return_value = {
+            "status": {"interfaces": [], "nodeName": "worker-1"}
+        }
+        with patch(
+            "krkn.health_checks.virt_health_check_plugin.invoke_no_exit",
+            return_value="False",
+        ) as mock_invoke:
+            result, new_ip, new_node = self.plugin.check_disconnected_access(
+                "10.0.0.1", "worker-1", "vm1"
+            )
+        self.assertFalse(result)
+        self.assertIsNone(new_ip)
+        self.assertIsNone(new_node)
+        self.assertEqual(mock_invoke.call_count, 2)
+        for call in mock_invoke.call_args_list:
+            self.assertNotIn("root@None", call.args[0])
+
+    def test_check_disconnected_access_node_migration_skips_none_ip(self):
+        """Test no node-migration probe runs to root@None when the new IP is unknown"""
+        # correct behaviour: skip the migrated-node probe when new_ip_address is None
+        self.mock_vm_plugin.get_vmi.return_value = {
+            "status": {"interfaces": [], "nodeName": "worker-2"}
+        }
+        with patch(
+            "krkn.health_checks.virt_health_check_plugin.invoke_no_exit",
+            return_value="False",
+        ) as mock_invoke:
+            result, new_ip, new_node = self.plugin.check_disconnected_access(
+                "10.0.0.1", "worker-1", "vm1"
+            )
+        self.assertFalse(result)
+        self.assertIsNone(new_ip)
+        self.assertIsNone(new_node)
+        for call in mock_invoke.call_args_list:
+            self.assertNotIn("root@None", call.args[0])
+
+
+class TestVirtBranchGaps(unittest.TestCase):
+    """Tests for remaining partial branches"""
+
+    def setUp(self):
+        self.factory = HealthCheckFactory()
+        if "virt_health_check" not in self.factory.loaded_plugins:
+            self.skipTest("Virt health check plugin not loaded (missing dependencies)")
+        self.plugin = self.factory.create_plugin(
+            "virt_health_check", iterations=2, krkn_lib=MagicMock()
+        )
+
+    @patch("krkn.health_checks.virt_health_check_plugin.invoke_no_exit")
+    def test_check_disconnected_access_ssh_node_fallback_fails(self, mock_invoke):
+        """Test check returns failure when the ssh_node fallback probe also fails"""
+        self.plugin.namespace = "default"
+        self.plugin.ssh_node = "bastion"
+        mock_vm_plugin = MagicMock()
+        mock_vm_plugin.get_vmi.return_value = {
+            "status": {"interfaces": [{"ipAddress": "10.0.0.1"}], "nodeName": "worker-1"}
+        }
+        self.plugin.kube_vm_plugin = mock_vm_plugin
+        mock_invoke.return_value = "False"
+
+        result, new_ip, new_node = self.plugin.check_disconnected_access(
+            "10.0.0.1", "worker-1", "vm1"
+        )
+        self.assertFalse(result)
+        self.assertIsNone(new_ip)
+        self.assertIsNone(new_node)
+
+    def test_get_ssh_status_disconnected_without_new_ip_leaves_vm_unchanged(self):
+        """Test a failed disconnected probe returning no new IP leaves the VM untouched"""
+        vm = MagicMock()
+        vm.vm_name = "vm1"
+        vm.namespace = "default"
+        vm.ip_address = "10.0.0.1"
+        vm.node_name = "worker-1"
+        vm.new_ip_address = ""
+        self.plugin.disconnected = True
+        with patch.object(
+            self.plugin, "check_disconnected_access", return_value=(True, None, None)
+        ):
+            self.assertTrue(self.plugin._get_ssh_status(vm))
+        self.assertEqual(vm.new_ip_address, "")
+        self.assertEqual(vm.node_name, "worker-1")
+
+    @patch("krkn.health_checks.virt_health_check_plugin.time.sleep")
+    def test_run_virt_check_batch_unchanged_status_single_entry(self, mock_sleep):
+        """Test an unchanged status across passes keeps a single tracker segment"""
+        vm = MagicMock()
+        vm.vm_name = "vm1"
+        vm.namespace = "default"
+        vm.ip_address = "10.0.0.1"
+        vm.node_name = "worker-1"
+        vm.new_ip_address = ""
+        self.plugin.disconnected = False
+        self.plugin.only_failures = False
+        call_count = [0]
+
+        def stop_after_two(*_):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                self.plugin.current_iterations = self.plugin.iterations
+
+        mock_sleep.side_effect = stop_after_two
+        with patch.object(self.plugin, "get_vm_access", return_value=True), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True):
+            telemetry_queue = queue.SimpleQueue()
+            self.plugin._run_virt_check_batch([vm], telemetry_queue)
+        result = telemetry_queue.get_nowait()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].check_type, "healthy")
+
+    @patch("krkn.health_checks.virt_health_check_plugin.time.sleep")
+    def test_run_virt_check_batch_only_failures_healthy_never_enqueued(self, mock_sleep):
+        """Test only_failures drops a VM that stays healthy for the whole run"""
+        vm = MagicMock()
+        vm.vm_name = "vm1"
+        vm.namespace = "default"
+        vm.ip_address = "10.0.0.1"
+        vm.node_name = "worker-1"
+        vm.new_ip_address = ""
+        self.plugin.disconnected = False
+        self.plugin.only_failures = True
+
+        def stop_after_sleep(*_):
+            self.plugin.current_iterations = self.plugin.iterations
+
+        mock_sleep.side_effect = stop_after_sleep
+        with patch.object(self.plugin, "get_vm_access", return_value=True), \
+             patch.object(self.plugin, "check_vmi_ready", return_value=True):
+            telemetry_queue = queue.SimpleQueue()
+            self.plugin._run_virt_check_batch([vm], telemetry_queue)
+        self.assertEqual(telemetry_queue.get_nowait(), [])
+
+    def test_gather_post_virt_checks_batch_thread_failure_isolated(self):
+        """Test a batch thread that dies before enqueueing is surfaced, not silently dropped"""
+        def fake_post_check(vm_batch, virt_telemetry, post_queue):
+            if vm_batch[0].vm_name == "vm1":
+                raise RuntimeError("thread died")
+            post_queue.put(["kept"])
+
+        vm_dead = MagicMock()
+        vm_dead.vm_name = "vm1"
+        vm_ok = MagicMock()
+        vm_ok.vm_name = "vm2"
+        self.plugin.vm_list = [vm_dead, vm_ok]
+        self.plugin.batch_size = 1
+        self.plugin.exit_on_failure = False
+
+        with patch("threading.excepthook") as excepthook, \
+             patch.object(self.plugin, "_run_post_virt_check",
+                          side_effect=fake_post_check):
+            result = self.plugin.gather_post_virt_checks(["stale"])
+
+        self.assertIs(excepthook.call_args.args[0].exc_type, RuntimeError)
+        self.assertIn("kept", result)
+        self.assertTrue(
+            any(getattr(entry, "vm_name", None) == "vm1" for entry in result),
+            "dead batch for vm1 should surface a failure entry in the result",
         )
 
 

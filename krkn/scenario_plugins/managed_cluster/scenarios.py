@@ -38,6 +38,7 @@ class Scenarios:
         self, instance_kill_count, managedcluster, timeout
     ):
         for _ in range(instance_kill_count):
+            failed = False
             try:
                 logging.info("Starting managedcluster_start_scenario injection")
                 file_loader = FileSystemLoader(
@@ -48,7 +49,7 @@ class Scenarios:
                 body = yaml.safe_load(
                     template.render(
                         managedcluster_name=managedcluster,
-                        args="""kubectl scale deployment.apps/klusterlet --replicas 3 &
+                        args="""kubectl scale deployment.apps/klusterlet --replicas 3 &&
                                 kubectl scale deployment.apps/klusterlet-registration-agent --replicas 1 -n open-cluster-management-agent""",
                     )
                 )
@@ -57,21 +58,35 @@ class Scenarios:
                     "managedcluster_start_scenario has been successfully injected!"
                 )
                 logging.info("Waiting for the specified timeout: %s" % timeout)
-                common_managedcluster_functions.wait_for_available_status(
+                if not common_managedcluster_functions.wait_for_available_status(
                     managedcluster, timeout, self.kubecli
-                )
+                ):
+                    raise Exception(
+                        "managedcluster %s did not become available within %s seconds"
+                        % (managedcluster, timeout)
+                    )
             except Exception as e:
                 logging.error("managedcluster scenario exiting due to Exception %s" % e)
+                failed = True
                 raise e
             finally:
                 logging.info("Deleting manifestworks")
-                self.kubecli.delete_manifestwork(managedcluster)
+                try:
+                    self.kubecli.delete_manifestwork(managedcluster)
+                except Exception as delete_error:
+                    # do not mask the original injection failure
+                    if not failed:
+                        raise
+                    logging.error(
+                        "failed to delete manifestworks: %s" % delete_error
+                    )
 
     # managedcluster scenario to stop the managedcluster
     def managedcluster_stop_scenario(
         self, instance_kill_count, managedcluster, timeout
     ):
         for _ in range(instance_kill_count):
+            failed = False
             try:
                 logging.info("Starting managedcluster_stop_scenario injection")
                 file_loader = FileSystemLoader(
@@ -91,15 +106,28 @@ class Scenarios:
                     "managedcluster_stop_scenario has been successfully injected!"
                 )
                 logging.info("Waiting for the specified timeout: %s" % timeout)
-                common_managedcluster_functions.wait_for_unavailable_status(
+                if not common_managedcluster_functions.wait_for_unavailable_status(
                     managedcluster, timeout, self.kubecli
-                )
+                ):
+                    raise Exception(
+                        "managedcluster %s did not become unavailable within %s seconds"
+                        % (managedcluster, timeout)
+                    )
             except Exception as e:
                 logging.error("managedcluster scenario exiting due to Exception %s" % e)
+                failed = True
                 raise e
             finally:
                 logging.info("Deleting manifestworks")
-                self.kubecli.delete_manifestwork(managedcluster)
+                try:
+                    self.kubecli.delete_manifestwork(managedcluster)
+                except Exception as delete_error:
+                    # do not mask the original injection failure
+                    if not failed:
+                        raise
+                    logging.error(
+                        "failed to delete manifestworks: %s" % delete_error
+                    )
 
     # managedcluster scenario to stop and then start the managedcluster
     def managedcluster_stop_start_scenario(
@@ -134,6 +162,7 @@ class Scenarios:
     # managedcluster scenario to start the klusterlet
     def start_klusterlet_scenario(self, instance_kill_count, managedcluster, timeout):
         for _ in range(instance_kill_count):
+            failed = False
             try:
                 logging.info("Starting start_klusterlet_scenario injection")
                 file_loader = FileSystemLoader(
@@ -154,16 +183,33 @@ class Scenarios:
                 time.sleep(
                     30
                 )  # until https://github.com/open-cluster-management-io/OCM/issues/118 gets solved
+                if not common_managedcluster_functions.wait_for_available_status(
+                    managedcluster, timeout, self.kubecli
+                ):
+                    raise Exception(
+                        "managedcluster %s did not become available within %s seconds"
+                        % (managedcluster, timeout)
+                    )
             except Exception as e:
                 logging.error("managedcluster scenario exiting due to Exception %s" % e)
+                failed = True
                 raise e
             finally:
                 logging.info("Deleting manifestworks")
-                self.kubecli.delete_manifestwork(managedcluster)
+                try:
+                    self.kubecli.delete_manifestwork(managedcluster)
+                except Exception as delete_error:
+                    # do not mask the original injection failure
+                    if not failed:
+                        raise
+                    logging.error(
+                        "failed to delete manifestworks: %s" % delete_error
+                    )
 
     # managedcluster scenario to stop the klusterlet
     def stop_klusterlet_scenario(self, instance_kill_count, managedcluster, timeout):
         for _ in range(instance_kill_count):
+            failed = False
             try:
                 logging.info("Starting stop_klusterlet_scenario injection")
                 file_loader = FileSystemLoader(
@@ -182,12 +228,28 @@ class Scenarios:
                 time.sleep(
                     30
                 )  # until https://github.com/open-cluster-management-io/OCM/issues/118 gets solved
+                if not common_managedcluster_functions.wait_for_unavailable_status(
+                    managedcluster, timeout, self.kubecli
+                ):
+                    raise Exception(
+                        "managedcluster %s did not become unavailable within %s seconds"
+                        % (managedcluster, timeout)
+                    )
             except Exception as e:
                 logging.error("managedcluster scenario exiting due to Exception %s" % e)
+                failed = True
                 raise e
             finally:
                 logging.info("Deleting manifestworks")
-                self.kubecli.delete_manifestwork(managedcluster)
+                try:
+                    self.kubecli.delete_manifestwork(managedcluster)
+                except Exception as delete_error:
+                    # do not mask the original injection failure
+                    if not failed:
+                        raise
+                    logging.error(
+                        "failed to delete manifestworks: %s" % delete_error
+                    )
 
     # managedcluster scenario to stop and start the klusterlet
     def stop_start_klusterlet_scenario(

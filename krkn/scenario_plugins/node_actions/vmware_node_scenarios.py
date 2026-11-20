@@ -239,7 +239,7 @@ class vSphere:
             resource_pool = resource_pool_summaries[0].resource_pool
             return resource_pool
         else:
-            logging.error("ResourcePool not found in Datacenter '{}'", datacenter)
+            logging.error("ResourcePool not found in Datacenter '%s'", datacenter)
             return None
 
     def create_default_vm(self, guest_os="RHEL_7_64", max_attempts=10):
@@ -333,6 +333,7 @@ class vSphere:
             if time_counter >= timeout:
                 logging.info(f"VM {instance_id} is still not deleted in allotted time")
                 exit_status = False
+                break
         end_time = time.time()
         if affected_node:
             affected_node.set_affected_node_status("terminated", end_time - start_time)
@@ -359,6 +360,7 @@ class vSphere:
             if time_counter >= timeout:
                 logging.info(f"VM {instance_id} is still not ready in allotted time")
                 exit_status = False
+                break
         end_time = time.time()
         if affected_node:
             affected_node.set_affected_node_status("running", end_time - start_time)
@@ -386,6 +388,7 @@ class vSphere:
             if time_counter >= timeout:
                 logging.info(f"VM {instance_id} is still not ready in allotted time")
                 exit_status = False
+                break
         end_time = time.time()
         if affected_node:
             affected_node.set_affected_node_status("stopped", end_time - start_time)

@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import re
 from typing import Optional, Tuple
 
 import yaml
@@ -63,12 +64,14 @@ def deploy_network_chaos_ng_pod(
     host_network: bool = True,
 ):
     file_loader = FileSystemLoader(os.path.abspath(os.path.dirname(__file__)))
-    env = Environment(loader=file_loader, autoescape=True)
+    env = Environment(loader=file_loader, autoescape=False)
     pod_template = env.get_template("templates/network-chaos.j2")
     tolerations = []
 
     for taint in config.taints:
         key_value_part, effect = taint.split(":", 1)
+        if not key_value_part.split("=", 1)[0]:
+            raise ValueError(f"invalid taint {taint!r}: empty key")
         if "=" in key_value_part:
             key, value = key_value_part.split("=", 1)
             operator = "Equal"
@@ -106,7 +109,12 @@ def get_pod_default_interface(
 ) -> str:
     cmd = "ip r | grep default | awk '/default/ {print $5}'"
     output = kubecli.exec_cmd_in_pod([cmd], pod_name, namespace)
-    return output.replace("\n", "")
+    interface = (output or "").strip().split("\n")[0].strip()
+    if not interface:
+        raise RuntimeError(
+            f"no default route found in pod {pod_name} (namespace {namespace})"
+        )
+    return interface
 
 
 def find_virt_launcher_netns_pid(
@@ -132,7 +140,7 @@ def find_virt_launcher_netns_pid(
                 chaos_pod_name,
                 namespace,
             )
-            if result and "tap" in result:
+            if result and re.search(r"(?m)^\s*\d+:\s*tap", result):
                 return pid
         except Exception as e:
             logging.warning(f"failed to check netns for PID {pid}: {e}")
@@ -161,7 +169,9 @@ def get_vmi_tap_interface(
         f"nsenter --target {pid} --net -- "
         f"ip link show | grep ': k6t-' | head -1 | cut -d: -f2 | tr -d ' '"
     )
-    bridge = kubecli.exec_cmd_in_pod([bridge_cmd], chaos_pod_name, namespace).strip()
+    bridge = (
+        kubecli.exec_cmd_in_pod([bridge_cmd], chaos_pod_name, namespace) or ""
+    ).strip()
     if not bridge:
         return ""
 
@@ -170,7 +180,7 @@ def get_vmi_tap_interface(
         f"ip link show master {bridge} | grep ': tap' | head -1 | cut -d: -f2 | tr -d ' '"
     )
     output = kubecli.exec_cmd_in_pod([tap_cmd], chaos_pod_name, namespace)
-    return output.strip()
+    return (output or "").strip()
 
 
 def get_vmi_masquerade_interface(

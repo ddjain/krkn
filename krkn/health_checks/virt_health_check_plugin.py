@@ -112,7 +112,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
 
     def is_configured(self, config: dict[str, Any]) -> bool:
         """Run only when the KubeVirt check namespace is explicitly configured."""
-        return bool(str(config.get("namespace", "")).strip())
+        return bool(str(config.get("namespace") or "").strip())
 
     def manages_own_threads(self) -> bool:
         """
@@ -167,6 +167,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
         node_name_list = [
             node_name for node_name in self.node_names.split(",") if node_name
         ]
+        self.vm_list = []
         for vmi in self.vmis_list:
             node_name = vmi.get("status", {}).get("nodeName")
             vmi_name = vmi.get("metadata", {}).get("name")
@@ -231,7 +232,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
             new_node_name = vmi.get("status", {}).get("nodeName")
 
             # Check if VM restarted with new IP
-            if new_ip_address != ip_address:
+            if new_ip_address and new_ip_address != ip_address:
                 virtctl_vm_cmd = f"ssh core@{worker_name} -o ConnectTimeout=5 'ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@{new_ip_address} 2>&1 | grep Permission' && echo 'True' || echo 'False'"
                 new_output = invoke_no_exit(virtctl_vm_cmd)
                 logging.debug(
@@ -241,7 +242,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
                     return True, new_ip_address, None
 
             # Check if VM migrated to new node
-            if new_node_name != worker_name:
+            if new_ip_address and new_node_name != worker_name:
                 virtctl_vm_cmd = f"ssh core@{new_node_name} -o ConnectTimeout=5 'ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@{new_ip_address} 2>&1 | grep Permission' && echo 'True' || echo 'False'"
                 new_output = invoke_no_exit(virtctl_vm_cmd)
                 logging.debug(
@@ -251,7 +252,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
                     return True, new_ip_address, new_node_name
 
             # Try common SSH node as fallback
-            if self.ssh_node:
+            if self.ssh_node and new_ip_address:
                 virtctl_vm_cmd = f"ssh core@{self.ssh_node} -o ConnectTimeout=5 'ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@{new_ip_address} 2>&1 | grep Permission' && echo 'True' || echo 'False'"
                 new_output = invoke_no_exit(virtctl_vm_cmd)
                 logging.debug(
@@ -493,25 +494,50 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
         :param kubevirt_check_telem: existing telemetry data
         :return: post-check telemetry data
         """
-        post_kubevirt_check_queue = queue.SimpleQueue()
         post_threads = []
 
         if self.batch_size > 0:
             for i in range(0, len(self.vm_list), self.batch_size):
                 sub_list = self.vm_list[i : i + self.batch_size]
+                batch_queue = queue.SimpleQueue()
                 t = threading.Thread(
                     target=self._run_post_virt_check,
                     name=str(i),
-                    args=(sub_list, kubevirt_check_telem, post_kubevirt_check_queue),
+                    args=(sub_list, kubevirt_check_telem, batch_queue),
                 )
-                post_threads.append(t)
+                post_threads.append((t, sub_list, batch_queue))
                 t.start()
 
             kubevirt_check_telem = []
-            for thread in post_threads:
+            for thread, sub_list, batch_queue in post_threads:
                 thread.join()
-                if not post_kubevirt_check_queue.empty():
-                    kubevirt_check_telem.extend(post_kubevirt_check_queue.get_nowait())
+                if not batch_queue.empty():
+                    kubevirt_check_telem.extend(batch_queue.get_nowait())
+                else:
+                    logging.error(
+                        f"Post-check batch thread {thread.name} produced no results"
+                    )
+                    now = datetime.now().isoformat()
+                    for vm in sub_list:
+                        kubevirt_check_telem.append(
+                            VirtCheck(
+                                {
+                                    "vm_name": vm.vm_name,
+                                    "ip_address": vm.ip_address,
+                                    "namespace": vm.namespace,
+                                    "node_name": vm.node_name,
+                                    "ssh_status": False,
+                                    "vmi_ready": False,
+                                    "status": False,
+                                    "check_type": "both",
+                                    "start_timestamp": now,
+                                    "new_ip_address": vm.new_ip_address,
+                                    "duration": 0,
+                                    "end_timestamp": now,
+                                    "phase": "post",
+                                }
+                            )
+                        )
 
         if self.exit_on_failure and len(kubevirt_check_telem) > 0:
             self.ret_value = 3
@@ -539,6 +565,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
             try:
                 ssh_status = self._get_ssh_status(vm)
             except Exception:
+                logging.exception("Exception in get vm status")
                 ssh_status = False
 
             vmi_ready = self.check_vmi_ready(vm.vm_name, vm.namespace)
@@ -624,7 +651,22 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
 
         # Initialize from config
         if not self._initialize_from_config(config):
-            return {"passed": True, "failures": [], "details": {}}
+            if self.namespace == "":
+                return {"passed": True, "failures": [], "details": {}}
+            message = "Virt health check initialization failed"
+            return {
+                "passed": False,
+                "failures": [
+                    {
+                        "vm_name": "",
+                        "namespace": self.namespace,
+                        "ssh_status": False,
+                        "vmi_ready": False,
+                        "message": message,
+                    }
+                ],
+                "details": {},
+            }
 
         failures = []
         details = {}
@@ -633,6 +675,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
         start_time = datetime.now()
 
         for vm in self.vm_list:
+            vm_start_time = datetime.now()
             try:
                 ssh_status = self._get_ssh_status(vm)
             except Exception as e:
@@ -653,7 +696,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
             # Create telemetry record if queue provided
             if telemetry_queue is not None:
                 end_time = datetime.now()
-                duration = (end_time - start_time).total_seconds()
+                duration = (end_time - vm_start_time).total_seconds()
                 telemetry_record = {
                     "vm_name": vm.vm_name,
                     "ip_address": vm.ip_address,
@@ -663,7 +706,7 @@ class VirtHealthCheckPlugin(AbstractHealthCheckPlugin):
                     "vmi_ready": vmi_ready,
                     "status": combined_status,
                     "check_type": self._compute_check_type(ssh_status, vmi_ready),
-                    "start_timestamp": start_time.isoformat(),
+                    "start_timestamp": vm_start_time.isoformat(),
                     "end_timestamp": end_time.isoformat(),
                     "duration": duration,
                     "new_ip_address": vm.new_ip_address,

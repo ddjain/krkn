@@ -42,6 +42,12 @@ class HogsScenarioPlugin(AbstractScenarioPlugin):
             with open(scenario, "r") as f:
                 scenario = yaml.safe_load(f)
             scenario_config = HogConfig.from_yaml_dict(scenario)
+            # krkn-lib does not cast numeric fields: quoted yaml values arrive as str
+            scenario_config.duration = int(scenario_config.duration)
+            if scenario_config.workers:
+                scenario_config.workers = int(scenario_config.workers)
+            if scenario_config.number_of_nodes:
+                scenario_config.number_of_nodes = int(scenario_config.number_of_nodes)
             
             # Get node-name if provided
             node_name = scenario.get('node-name')
@@ -104,31 +110,37 @@ class HogsScenarioPlugin(AbstractScenarioPlugin):
                 ),
             )
             lib_k8s.deploy_hog(pod_name, config)
-            start = time.time()
-            # waiting 3 seconds before starting sample collection
-            time.sleep(3)
-            node_resources_end = lib_k8s.get_node_resources_info(node)
+            try:
+                start = time.time()
+                # waiting 3 seconds before starting sample collection
+                time.sleep(3)
+                node_resources_end = lib_k8s.get_node_resources_info(node)
 
-            samples: list[NodeResources] = []
+                samples: list[NodeResources] = []
+
+                while time.time() - start < config.duration-1:
+                    samples.append(lib_k8s.get_node_resources_info(node))
+
+                max_wait = 30
+                wait = 0
+                logging.info(f"[{node}] waiting {max_wait} up to seconds pod: {pod_name} namespace: {config.namespace} to finish")
+                while lib_k8s.is_pod_running(pod_name, config.namespace):
+                    if wait >= max_wait:
+                        raise Exception(f"[{node}] hog workload pod: {pod_name} namespace: {config.namespace} "
+                                        f"didn't finish after {max_wait}")
+                    time.sleep(1)
+                    wait += 1
+                    continue
+            finally:
+                logging.info(f"[{node}] deleting pod: {pod_name} namespace: {config.namespace}")
+                lib_k8s.delete_pod(pod_name, config.namespace)
+
+            if not samples:
+                logging.warning(f"[{node}] no resource samples collected "
+                                f"(duration {config.duration}s is too short), skipping consumption report")
+                return
+
             avg_node_resources = NodeResources()
-
-            while time.time() - start < config.duration-1:
-                samples.append(lib_k8s.get_node_resources_info(node))
-
-            max_wait = 30
-            wait = 0
-            logging.info(f"[{node}] waiting {max_wait} up to seconds pod: {pod_name} namespace: {config.namespace} to finish")
-            while lib_k8s.is_pod_running(pod_name, config.namespace):
-                if wait >= max_wait:
-                    raise Exception(f"[{node}] hog workload pod: {pod_name} namespace: {config.namespace} "
-                                    f"didn't finish after {max_wait}")
-                time.sleep(1)
-                wait += 1
-                continue
-
-            logging.info(f"[{node}] deleting pod: {pod_name} namespace: {config.namespace}")
-            lib_k8s.delete_pod(pod_name, config.namespace)
-
             for resource in samples:
                 avg_node_resources.cpu += resource.cpu
                 avg_node_resources.memory += resource.memory
@@ -139,8 +151,12 @@ class HogsScenarioPlugin(AbstractScenarioPlugin):
             avg_node_resources.disk_space = avg_node_resources.disk_space / len(samples)
 
             if config.type == HogType.cpu:
-                logging.info(f"[{node}] detected cpu consumption: "
-                             f"{(avg_node_resources.cpu / (config.workers * 1000000000)) * 100} %")
+                if config.workers:
+                    logging.info(f"[{node}] detected cpu consumption: "
+                                 f"{(avg_node_resources.cpu / (config.workers * 1000000000)) * 100} %")
+                else:
+                    logging.warning(f"[{node}] no workers/cpus detected, skipping cpu consumption report")
+
             if config.type == HogType.memory:
                 logging.info(f"[{node}] detected memory increase: "
                              f"{avg_node_resources.memory / node_resources_start.memory * 100} %")
@@ -171,7 +187,8 @@ class HogsScenarioPlugin(AbstractScenarioPlugin):
         errors = []
         while True:
             try:
-                errors.append(str(exception_queue.get_nowait()))
+                err = exception_queue.get_nowait()
+                errors.append(str(err) or repr(err))
             except queue.Empty:
                 break
         if errors:

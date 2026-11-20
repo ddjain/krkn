@@ -447,7 +447,7 @@ def apply_net_policy(
     yml_list = []
 
     for pod_ip in set(ips):
-        pod_inf = get_pod_interface(node, pod_ip, pod_template, bridge_name, kubecli)
+        pod_inf = get_pod_interface(node, pod_ip, pod_template, bridge_name, kubecli, image)
         exec_cmd = get_egress_cmd(
             test_execution, pod_inf, mod, network_params, duration
         )

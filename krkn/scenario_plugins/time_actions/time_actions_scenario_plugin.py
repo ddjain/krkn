@@ -74,7 +74,11 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
                 time.sleep(2)
                 continue
             else:
-                break
+                return response
+        if response and (
+            "unauthorized" in response.lower() or "authorization" in response.lower()
+        ):
+            return False
         return response
 
     def exec_with_shell_fallback(self, command, pod_name, namespace, container_name, kubecli: KrknKubernetes, max_retries=3):
@@ -129,6 +133,10 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
                     "Container name %s not an existing container in pod %s"
                     % (container_name, pod_name)
                 )
+                raise RuntimeError(
+                    "Container name %s not an existing container in pod %s"
+                    % (container_name, pod_name)
+                )
         else:
             container_name = container_names[
                 # random module here is not used for security/cryptographic
@@ -163,7 +171,9 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
                 logging.warning(
                     f'ntp unactive on node {node_name} skewing {"time" if action == "skew_time" else "date"} to {param}'
                 )
-                self.pod_exec(skew_pod_name, skew_command, pod_namespace, None, kubecli)
+                kubecli.exec_command_on_node(
+                    node_name, skew_command, skew_pod_name, pod_namespace
+                )
             else:
                 logging.info(
                     f'ntp active in cluster node, {"time" if action == "skew_time" else "date"} skewing will have no effect, skipping'
@@ -208,7 +218,10 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
             container_name = get_yaml_item_value(scenario, "container_name", "")
             pod_names = []
             if "object_name" in scenario.keys() and scenario["object_name"]:
-                for name in scenario["object_name"]:
+                object_names = scenario["object_name"]
+                if isinstance(object_names, str):
+                    object_names = [object_names]
+                for name in object_names:
                     if "namespace" not in scenario.keys():
                         logging.error("Need to set namespace when using pod name")
                         # removed_exit
@@ -265,7 +278,7 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
                         selected_container_name,
                         kubecli,
                     )
-                    if pod_exec_response is False:
+                    if not pod_exec_response:
                         logging.error(
                             "Couldn't reset time on container %s "
                             "in pod %s in namespace %s"
@@ -286,7 +299,7 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
                         selected_container_name,
                         kubecli,
                     )
-                    if pod_exec_response is False:
+                    if not pod_exec_response:
                         logging.error(
                             "Couldn't reset time on container "
                             "%s in pod %s in namespace %s"
@@ -306,8 +319,8 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
             logging.info("Obj_date time " + str(obj_datetime))
             obj_datetime = re.sub(r"\s\s+", " ", obj_datetime).strip()
             logging.info("Obj_date sub time " + str(obj_datetime))
-            date_line = re.match(
-                r"[\s\S\n]*\w{3} \w{3} \d{1,} \d{2}:\d{2}:\d{2} \w{3} \d{4}[\s\S\n]*",  # noqa
+            date_line = re.search(
+                r"\w{3} \w{3} \d{1,} \d{2}:\d{2}:\d{2} \w{3} \d{4}",
                 obj_datetime,
             )
             if date_line is not None:
@@ -324,8 +337,13 @@ class TimeActionsScenarioPlugin(AbstractScenarioPlugin):
     def string_to_date(self, obj_datetime):
         obj_datetime = self.parse_string_date(obj_datetime)
         try:
+            # drop the zone abbreviation: %Z only accepts UTC/GMT and the
+            # host's own zone names
+            obj_datetime = re.sub(
+                r"(\d{2}:\d{2}:\d{2}) \w{3} ", r"\1 ", obj_datetime
+            )
             date_time_obj = datetime.datetime.strptime(
-                obj_datetime, "%a %b %d %H:%M:%S %Z %Y"
+                obj_datetime, "%a %b %d %H:%M:%S %Y"
             )
             return date_time_obj
         except Exception:

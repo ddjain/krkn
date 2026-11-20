@@ -29,6 +29,7 @@ Assisted By: Claude Code
 
 import copy
 import itertools
+import logging
 import os
 import sys
 import tempfile
@@ -1336,6 +1337,689 @@ class TestVmiOutageScenarioPlugin(unittest.TestCase):
         )
         self.k8s_client.create_pod.assert_not_called()
         self.k8s_client.exec_cmd_in_pod.assert_not_called()
+
+
+class TestVmiOutageGaps(unittest.TestCase):
+    """Coverage-gap tests for vmi_outage_scenario_plugin (appended)."""
+
+    def setUp(self):
+        self.plugin = VmiOutageScenarioPlugin()
+        try:
+            self.k8s_client = MagicMock(spec=KrknKubernetes)
+        except Exception:
+            self.k8s_client = MagicMock()
+        self.k8s_client.custom_object_client = MagicMock()
+        self.plugin.k8s_client = self.k8s_client
+        self.plugin.custom_object_client = self.k8s_client.custom_object_client
+        self.telemetry = MagicMock(spec=KrknTelemetryOpenshift)
+        self.scenario_telemetry = MagicMock(spec=ScenarioTelemetry)
+        self.telemetry.get_lib_kubernetes.return_value = self.k8s_client
+        self.mock_vmi = {
+            "metadata": {
+                "name": "test-vm",
+                "namespace": "default",
+                "creationTimestamp": "2023-01-01T00:00:00Z",
+            },
+            "status": {"phase": "Running"},
+        }
+        from krkn.scenario_plugins.vmi_outage.vmi_outage_scenario_plugin import (
+            _as_bool,
+            _as_number,
+        )
+
+        self._as_bool = _as_bool
+        self._as_number = _as_number
+
+    def run_with_config(self, config):
+        """Run plugin.run() against an in-memory YAML config."""
+        with patch(
+            "builtins.open",
+            unittest.mock.mock_open(read_data=yaml.dump(config)),
+        ):
+            return self.plugin.run(
+                "test-uuid",
+                "scenario.yaml",
+                self.telemetry,
+                self.scenario_telemetry,
+            )
+
+    def test_as_bool_none_value_returns_default(self):
+        """YAML null must fall back to the caller default, not False."""
+        self.assertTrue(self._as_bool(None, True))
+        self.assertFalse(self._as_bool(None, False))
+
+    def test_as_bool_numeric_value_uses_truthiness(self):
+        self.assertTrue(self._as_bool(1))
+        self.assertFalse(self._as_bool(0.0))
+
+    def test_as_bool_non_str_falls_back_to_bool_cast(self):
+        self.assertTrue(self._as_bool([1]))
+        self.assertFalse(self._as_bool([]))
+
+    def test_as_number_bool_value_returns_default(self):
+        """YAML true must not become 1 (guest_ping_timeout: true -> 300)."""
+        self.assertEqual(self._as_number(True, 300, int), 300)
+        self.assertEqual(self._as_number(False, 2.5, float), 2.5)
+
+    def test_run_unknown_scenario_name_skips_execution(self):
+        """Unrecognized scenario names are skipped without executing chaos."""
+        self.plugin.execute_scenario = MagicMock()
+        config = {
+            "scenarios": [
+                {
+                    "name": "other",
+                    "scenario": "pod_outage",
+                    "parameters": {"vm_name": "test-vm"},
+                }
+            ]
+        }
+        self.run_with_config(config)
+        self.plugin.execute_scenario.assert_not_called()
+
+    # suspected bug: unrecognised scenario type returns success having injected nothing
+    @unittest.expectedFailure
+    def test_run_unknown_scenario_name_reports_failure(self):
+        self.plugin.execute_scenario = MagicMock()
+        config = {
+            "scenarios": [
+                {
+                    "name": "other",
+                    "scenario": "pod_outage",
+                    "parameters": {"vm_name": "test-vm"},
+                }
+            ]
+        }
+        result = self.run_with_config(config)
+        self.assertNotEqual(result, 0)
+
+    def test_run_missing_scenarios_key_returns_failure(self):
+        """A config without the scenarios key must fail, not raise."""
+        result = self.run_with_config({"not-scenarios": []})
+        self.assertEqual(result, 1)
+
+    def test_run_non_dict_yaml_returns_failure(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data="[]")):
+            result = self.plugin.run(
+                "test-uuid",
+                "scenario.yaml",
+                self.telemetry,
+                self.scenario_telemetry,
+            )
+        self.assertEqual(result, 1)
+
+    def test_patch_vm_spec_adds_spec_when_missing(self):
+        self.k8s_client.get_vm.return_value = {
+            "metadata": {"name": "test-vm"}
+        }
+        result = self.plugin.patch_vm_spec("test-vm", "default", True)
+        self.assertTrue(result)
+        self.k8s_client.patch_vm.assert_called_once_with(
+            "test-vm",
+            "default",
+            {"metadata": {"name": "test-vm"}, "spec": {"running": True}},
+        )
+
+    def test_get_vmi_ips_skips_non_dict_interface_entry(self):
+        vmi = {
+            "status": {
+                "interfaces": ["garbage", {"ipAddress": "10.0.0.9"}]
+            }
+        }
+        self.assertEqual(
+            VmiOutageScenarioPlugin.get_vmi_ips(vmi), ["10.0.0.9"]
+        )
+
+    def test_execute_scenario_probe_pod_prep_failure_sets_error(self):
+        config = {
+            "parameters": {
+                "vm_name": "test-vm",
+                "namespace": "default",
+                "wait_for_guest_ping": True,
+            }
+        }
+        self.plugin._ensure_guest_probe_pod = MagicMock(
+            side_effect=RuntimeError("image pull failed")
+        )
+        self.k8s_client.get_vmis.return_value = [self.mock_vmi]
+
+        # Bounded clock/sleep: a regression that skips the early return must
+        # reach delete_vmi's poll loop and fail fast instead of hanging.
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.execute_scenario(config, self.scenario_telemetry)
+
+        self.assertIn("Failed to prepare guest probe pod", result.error)
+        self.assertEqual(len(result.unrecovered), 0)
+        self.k8s_client.delete_vmi.assert_not_called()
+
+    def test_execute_scenario_guest_ping_timeout_deletes_owned_probe_pod(self):
+        config = {
+            "parameters": {
+                "vm_name": "test-vm",
+                "namespace": "default",
+                "wait_for_guest_ping": True,
+            }
+        }
+        self.plugin._ensure_guest_probe_pod = MagicMock(
+            return_value=("krkn-guest-ping-1", True)
+        )
+        self.plugin.wait_for_guest_reachable = MagicMock(return_value=1)
+        self.k8s_client.get_vmis.return_value = [self.mock_vmi]
+        self.k8s_client.get_vms.return_value = [
+            {"metadata": {"name": "test-vm"}}
+        ]
+        recreated = copy.deepcopy(self.mock_vmi)
+        recreated["metadata"]["creationTimestamp"] = "2023-01-01T00:05:00Z"
+        self.k8s_client.get_vmi.side_effect = [
+            self.mock_vmi,
+            self.mock_vmi,
+            recreated,
+            recreated,
+        ]
+        self.k8s_client.delete_pod = MagicMock()
+
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.execute_scenario(
+                config, self.scenario_telemetry
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.unrecovered), 1)
+        self.assertEqual(result.unrecovered[0].vmi_name, "test-vm")
+        self.k8s_client.delete_pod.assert_called_once_with(
+            "krkn-guest-ping-1", "default", grace_period_seconds=0
+        )
+
+    # CHARACTERIZATION: a VMI without metadata is skipped and reported as
+    # unrecovered rather than aborting the scenario.
+    def test_execute_scenario_vmi_without_metadata_is_unrecovered(self):
+        config = {"parameters": {"vm_name": "test-vm", "namespace": "default"}}
+        self.k8s_client.get_vmis.return_value = [{"spec": {}}]
+
+        result = self.plugin.execute_scenario(config, self.scenario_telemetry)
+
+        self.assertIsInstance(result, VmisStatus)
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.unrecovered), 1)
+        self.assertEqual(len(result.recovered), 0)
+
+    def test_execute_scenario_malformed_vmi_skipped_others_processed(self):
+        config = {
+            "parameters": {
+                "vm_name": "test-vm",
+                "namespace": "default",
+                "kill_count": 2,
+            }
+        }
+        self.k8s_client.get_vmis.return_value = [{"spec": {}}, self.mock_vmi]
+        self.k8s_client.get_vms.return_value = [
+            {"metadata": {"name": "test-vm"}}
+        ]
+        recreated = copy.deepcopy(self.mock_vmi)
+        recreated["metadata"]["creationTimestamp"] = "2023-01-01T00:05:00Z"
+        self.k8s_client.get_vmi.side_effect = [
+            self.mock_vmi,
+            self.mock_vmi,
+            recreated,
+            recreated,
+        ]
+
+        with patch("random.randint", side_effect=[0, 1]), patch(
+            "time.sleep"
+        ), patch("time.time", side_effect=itertools.count(0, 0.5)):
+            result = self.plugin.execute_scenario(
+                config, self.scenario_telemetry
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.recovered), 1)
+        self.assertEqual(result.recovered[0].vmi_name, "test-vm")
+        self.assertEqual(len(result.unrecovered), 1)
+
+    def test_execute_scenario_non_positive_kill_count_sets_error(self):
+        self.k8s_client.get_vmis.return_value = [self.mock_vmi]
+        for kill_count in (0, -1):
+            with self.subTest(kill_count=kill_count):
+                config = {
+                    "parameters": {
+                        "vm_name": "test-vm",
+                        "namespace": "default",
+                        "kill_count": kill_count,
+                    }
+                }
+                result = self.plugin.execute_scenario(
+                    config, self.scenario_telemetry
+                )
+                self.assertIsNotNone(result.error)
+
+    def test_execute_scenario_api_exception_mid_wait_sets_error(self):
+        config = {
+            "parameters": {
+                "vm_name": "test-vm",
+                "namespace": "default",
+                "kill_count": 1,
+            }
+        }
+        self.k8s_client.get_vmis.return_value = [self.mock_vmi]
+        self.k8s_client.get_vms.return_value = [
+            {"metadata": {"name": "test-vm"}}
+        ]
+        recreated = copy.deepcopy(self.mock_vmi)
+        recreated["metadata"]["creationTimestamp"] = "2023-01-01T00:05:00Z"
+        self.k8s_client.get_vmi.side_effect = [
+            self.mock_vmi,
+            self.mock_vmi,
+            recreated,
+            ApiException(status=500, reason="Server Error"),
+        ]
+
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.execute_scenario(
+                config, self.scenario_telemetry
+            )
+
+        self.assertIn("Error executing VMI outage scenario", result.error)
+        self.assertIn("Server Error", result.error)
+        self.assertEqual(len(result.unrecovered), 0)
+
+    def test_execute_scenario_settle_zero_skips_sleep(self):
+        config = {
+            "parameters": {
+                "vm_name": "test-vm",
+                "namespace": "default",
+                "wait_for_guest_ping": True,
+                "guest_ping_settle_seconds": 0,
+            }
+        }
+        self.plugin._ensure_guest_probe_pod = MagicMock(
+            return_value=("krkn-guest-ping-1", True)
+        )
+        self.plugin.wait_for_guest_reachable = MagicMock(return_value=0)
+        self.k8s_client.get_vmis.return_value = [self.mock_vmi]
+        self.k8s_client.get_vms.return_value = [
+            {"metadata": {"name": "test-vm"}}
+        ]
+        recreated = copy.deepcopy(self.mock_vmi)
+        recreated["metadata"]["creationTimestamp"] = "2023-01-01T00:05:00Z"
+        self.k8s_client.get_vmi.side_effect = [
+            self.mock_vmi,
+            self.mock_vmi,
+            recreated,
+            recreated,
+        ]
+        self.k8s_client.delete_pod = MagicMock()
+
+        with patch("time.sleep") as mock_sleep, patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.execute_scenario(
+                config, self.scenario_telemetry
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.recovered), 1)
+        mock_sleep.assert_not_called()
+        self.plugin._ensure_guest_probe_pod.assert_called_once()
+
+    def test_wait_for_probe_pod_ready_succeeds_on_second_poll(self):
+        self.k8s_client.is_pod_running.side_effect = [False, True]
+        with patch("time.sleep") as mock_sleep, patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            self.plugin._wait_for_probe_pod_ready("p1", "default", 180)
+        mock_sleep.assert_called_once_with(2)
+
+    def test_ensure_guest_probe_pod_reuse_tcp_returns_not_owned(self):
+        self.k8s_client.is_pod_running.return_value = True
+        with patch(
+            "krkn.scenario_plugins.vmi_outage."
+            "vmi_outage_scenario_plugin.logging.warning"
+        ) as mock_warn:
+            result = self.plugin._ensure_guest_probe_pod(
+                "default", probe_pod="pre-pod", method="tcp"
+            )
+        self.assertEqual(result, ("pre-pod", False))
+        mock_warn.assert_not_called()
+
+    def test_delete_guest_probe_pod_empty_name_is_noop(self):
+        self.plugin._delete_guest_probe_pod("", "default")
+        self.k8s_client.delete_pod.assert_not_called()
+
+    def test_delete_guest_probe_pod_failure_logs_and_swallows(self):
+        self.k8s_client.delete_pod.side_effect = ApiException(
+            status=404, reason="Not Found"
+        )
+        with self.assertLogs(level="WARNING") as logs:
+            self.plugin._delete_guest_probe_pod("p1", "default")
+        self.assertTrue(
+            any("Failed to delete guest probe pod" in m for m in logs.output)
+        )
+
+    def test_probe_guest_via_pod_invalid_method_returns_false(self):
+        result = self.plugin.probe_guest_via_pod(
+            "10.0.0.1", "p1", "default", method="udp", port=22
+        )
+        self.assertFalse(result)
+        self.k8s_client.exec_cmd_in_pod.assert_not_called()
+
+    def test_probe_guest_via_pod_rbac_denied_returns_false(self):
+        self.k8s_client.exec_cmd_in_pod.side_effect = ApiException(
+            status=403, reason="Forbidden"
+        )
+        with self.assertLogs(level="WARNING") as logs:
+            result = self.plugin.probe_guest_via_pod(
+                "10.0.0.1", "p1", "default", method="tcp", port=22
+            )
+        self.assertFalse(result)
+        self.assertTrue(any("pods/exec" in m for m in logs.output))
+
+    def test_probe_guest_via_pod_forbidden_message_returns_false(self):
+        self.k8s_client.exec_cmd_in_pod.side_effect = Exception(
+            "pods \"p1\" is forbidden: cannot exec"
+        )
+        with self.assertLogs(level="WARNING") as logs:
+            result = self.plugin.probe_guest_via_pod(
+                "10.0.0.1", "p1", "default", method="icmp"
+            )
+        self.assertFalse(result)
+        self.assertTrue(any("denied" in m for m in logs.output))
+
+    def test_probe_guest_via_pod_other_failure_debug_only(self):
+        self.k8s_client.exec_cmd_in_pod.side_effect = Exception(
+            "connection refused"
+        )
+        with patch(
+            "krkn.scenario_plugins.vmi_outage."
+            "vmi_outage_scenario_plugin.logging.warning"
+        ) as mock_warn, self.assertLogs(level="DEBUG") as logs:
+            result = self.plugin.probe_guest_via_pod(
+                "10.0.0.1", "p1", "default", method="icmp"
+            )
+        self.assertFalse(result)
+        mock_warn.assert_not_called()
+        self.assertTrue(any("failed" in m for m in logs.output))
+
+    def test_wait_for_guest_reachable_missing_probe_pod_returns_one(self):
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.wait_for_guest_reachable(
+                "test-vm", "default", timeout=300, probe_pod=None
+            )
+        self.assertEqual(result, 1)
+        self.k8s_client.get_vmi.assert_not_called()
+
+    def test_wait_for_guest_reachable_retries_until_ip_appears(self):
+        vmi_with_ip = {
+            "status": {"interfaces": [{"ipAddress": "10.0.0.9"}]}
+        }
+        self.k8s_client.get_vmi.side_effect = [
+            {},
+            {},
+            vmi_with_ip,
+        ]
+        self.k8s_client.exec_cmd_in_pod.return_value = "OK\n"
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        with patch("time.sleep") as mock_sleep, patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.wait_for_guest_reachable(
+                "test-vm",
+                "default",
+                timeout=300,
+                interval=2,
+                probe_pod="p1",
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(mock_sleep.call_count, 2)
+        mock_sleep.assert_called_with(2)
+        self.assertIsNotNone(self.plugin.affected_vmi.guest_reachable_time)
+
+    def test_wait_for_guest_reachable_probe_fails_then_succeeds(self):
+        vmi_with_ip = {
+            "status": {"interfaces": [{"ipAddress": "10.0.0.9"}]}
+        }
+        self.k8s_client.get_vmi.return_value = vmi_with_ip
+        self.k8s_client.exec_cmd_in_pod.side_effect = ["FAIL\n", "OK\n"]
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.wait_for_guest_reachable(
+                "test-vm", "default", timeout=300, probe_pod="p1"
+            )
+        self.assertEqual(result, 0)
+        self.assertIsNotNone(self.plugin.affected_vmi.guest_reachable_time)
+
+    def test_wait_for_guest_reachable_polls_until_timeout(self):
+        vmi_with_ip = {
+            "status": {"interfaces": [{"ipAddress": "10.0.0.9"}]}
+        }
+        self.k8s_client.get_vmi.return_value = vmi_with_ip
+        self.k8s_client.exec_cmd_in_pod.return_value = "FAIL\n"
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        with patch("time.sleep") as mock_sleep, patch(
+            "time.time", side_effect=itertools.count(0, 1)
+        ):
+            result = self.plugin.wait_for_guest_reachable(
+                "test-vm", "default", timeout=3, probe_pod="p1"
+            )
+        self.assertEqual(result, 1)
+        self.assertEqual(self.k8s_client.exec_cmd_in_pod.call_count, 2)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_recover_unexpected_error_returns_failure(self):
+        self.plugin.original_vmi = None
+        with patch(
+            "krkn.scenario_plugins.vmi_outage."
+            "vmi_outage_scenario_plugin.AffectedVMI",
+            side_effect=RuntimeError("model broken"),
+        ):
+            result = self.plugin.recover("test-vm", "default")
+        self.assertEqual(result, 1)
+
+    def test_recover_original_without_metadata_creates_unchanged(self):
+        self.plugin.original_vmi = {"spec": {"domain": {}}}
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=0)
+
+        result = self.plugin.recover("test-vm", "default")
+
+        self.assertEqual(result, 0)
+        self.k8s_client.create_vmi.assert_called_once_with(
+            "test-vm", "default", {"spec": {"domain": {}}}
+        )
+
+    def test_recover_clean_metadata_keeps_untouched_fields(self):
+        original = {
+            "spec": {"domain": {}},
+            "metadata": {"name": "test-vm", "namespace": "default"},
+        }
+        self.plugin.original_vmi = original
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=0)
+
+        result = self.plugin.recover("test-vm", "default")
+
+        self.assertEqual(result, 0)
+        self.k8s_client.create_vmi.assert_called_once_with(
+            "test-vm", "default", original
+        )
+        self.assertIn("name", self.k8s_client.create_vmi.call_args[0][2]["metadata"])
+
+    def test_recover_strips_server_generated_metadata_fields(self):
+        original = {
+            "spec": {"domain": {}},
+            "metadata": {
+                "name": "test-vm",
+                "namespace": "default",
+                "resourceVersion": "12345",
+                "uid": "abc-123",
+                "creationTimestamp": "2023-01-01T00:00:00Z",
+                "generation": 3,
+            },
+        }
+        self.plugin.original_vmi = original
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=0)
+
+        result = self.plugin.recover("test-vm", "default")
+
+        self.assertEqual(result, 0)
+        self.k8s_client.create_vmi.assert_called_once()
+        # recover() deepcopies original_vmi, so inspect the dict it sent.
+        created = self.k8s_client.create_vmi.call_args[0][2]
+        self.assertEqual(
+            created["metadata"], {"name": "test-vm", "namespace": "default"}
+        )
+
+    def test_recover_does_not_mutate_saved_original_metadata(self):
+        original = {
+            "spec": {"domain": {}},
+            "metadata": {
+                "name": "test-vm",
+                "namespace": "default",
+                "resourceVersion": "12345",
+                "uid": "abc-123",
+                "creationTimestamp": "2023-01-01T00:00:00Z",
+                "generation": 3,
+            },
+        }
+        self.plugin.original_vmi = original
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=0)
+
+        result = self.plugin.recover("test-vm", "default")
+
+        self.assertEqual(result, 0)
+        self.k8s_client.create_vmi.assert_called_once()
+        created = self.k8s_client.create_vmi.call_args[0][2]
+        for field in ["resourceVersion", "uid", "creationTimestamp", "generation"]:
+            self.assertNotIn(field, created["metadata"])
+        # The saved original must be untouched by recover().
+        self.assertIs(self.plugin.original_vmi, original)
+        for field in ["resourceVersion", "uid", "creationTimestamp", "generation"]:
+            self.assertIn(field, self.plugin.original_vmi["metadata"])
+
+    def test_recover_wait_for_running_success_returns_zero(self):
+        self.plugin.original_vmi = {
+            "metadata": {"name": "test-vm", "namespace": "default"}
+        }
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=0)
+
+        result = self.plugin.recover("test-vm", "default")
+
+        self.assertEqual(result, 0)
+
+    def test_recover_wait_for_running_timeout_returns_failure(self):
+        self.plugin.original_vmi = {
+            "metadata": {"name": "test-vm", "namespace": "default"}
+        }
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=1)
+
+        result = self.plugin.recover("test-vm", "default")
+
+        self.assertEqual(result, 1)
+
+    def test_recover_wait_for_running_success_does_not_warn(self):
+        self.plugin.original_vmi = {
+            "metadata": {"name": "test-vm", "namespace": "default"}
+        }
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.plugin.wait_for_running = MagicMock(return_value=0)
+
+        with patch(
+            "krkn.scenario_plugins.vmi_outage."
+            "vmi_outage_scenario_plugin.logging.warning"
+        ) as mock_warn:
+            self.plugin.recover("test-vm", "default")
+
+        self.assertFalse(
+            any("didn't reach Running" in str(c) for c in mock_warn.call_args_list)
+        )
+
+    def test_get_vmi_ips_skips_empty_secondary_address(self):
+        vmi = {
+            "status": {
+                "interfaces": [
+                    {"ipAddress": "10.0.0.9", "ipAddresses": ["", "10.0.0.10"]}
+                ]
+            }
+        }
+        self.assertEqual(
+            VmiOutageScenarioPlugin.get_vmi_ips(vmi),
+            ["10.0.0.9", "10.0.0.10"],
+        )
+
+    def test_wait_for_probe_pod_ready_times_out(self):
+        self.k8s_client.is_pod_running.return_value = False
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 100)
+        ):
+            with self.assertRaisesRegex(TimeoutError, "p1.*within 180s"):
+                self.plugin._wait_for_probe_pod_ready("p1", "default", 180)
+        self.k8s_client.is_pod_running.assert_called()
+
+    def test_delete_vmi_none_baseline_timestamp_not_reported_recreated(self):
+        self.plugin.original_vmi = {
+            "metadata": {"name": "test-vm", "namespace": "default"}
+        }
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.k8s_client.get_vmi.return_value = self.mock_vmi
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.delete_vmi("test-vm", "default", timeout=2)
+        self.assertEqual(result, 1)
+        self.assertIsNone(self.plugin.affected_vmi.vmi_rescheduling_time)
+
+    def test_delete_vmi_both_none_timestamps_not_reported_recreated(self):
+        self.plugin.original_vmi = {
+            "metadata": {"name": "test-vm", "namespace": "default"}
+        }
+        self.plugin.affected_vmi = AffectedVMI(
+            vmi_name="test-vm", namespace="default"
+        )
+        self.k8s_client.get_vmi.return_value = {
+            "metadata": {"name": "test-vm", "namespace": "default"}
+        }
+        with patch("time.sleep"), patch(
+            "time.time", side_effect=itertools.count(0, 0.5)
+        ):
+            result = self.plugin.delete_vmi("test-vm", "default", timeout=2)
+        self.assertEqual(result, 1)
+        self.assertIsNone(self.plugin.affected_vmi.vmi_rescheduling_time)
 
 
 if __name__ == "__main__":

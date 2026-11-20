@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 import os
 import time
@@ -206,6 +207,11 @@ class VmiOutageScenarioPlugin(AbstractScenarioPlugin):
             if not vm_name and not label_selector:
                 logging.error("Either vm_name or label_selector parameter is required")
                 return self.vmis_status
+            if kill_count <= 0:
+                message = f"Invalid kill_count={kill_count!r}; expected a positive integer"
+                logging.error(message)
+                self.vmis_status.error = message
+                return self.vmis_status
             self.vmis_status = VmisStatus()
             name_regex = vm_name or ".*"
             self.vmis_list = self.k8s_client.get_vmis(name_regex, namespace, label_selector=label_selector)
@@ -253,8 +259,16 @@ class VmiOutageScenarioPlugin(AbstractScenarioPlugin):
 
                     target = f"label_selector={label_selector}" if label_selector else f"vm_name={vm_name}"
                     logging.info(f"Starting VMI outage scenario for {target} in namespace: {namespace}")
-                    vmi_name = vmi.get("metadata").get("name")
-                    vmi_namespace = vmi.get("metadata").get("namespace")
+                    vmi_metadata = vmi.get("metadata") or {}
+                    vmi_name = vmi_metadata.get("name")
+                    vmi_namespace = vmi_metadata.get("namespace")
+
+                    if not vmi_name:
+                        logging.error(f"Skipping malformed VMI without metadata.name: {vmi}")
+                        self.vmis_status.unrecovered.append(
+                            AffectedVMI(vmi_name=vmi_name, namespace=vmi_namespace)
+                        )
+                        continue
 
                     # Create affected_vmi early so we can track failures
                     self.affected_vmi = AffectedVMI(
@@ -414,7 +428,7 @@ class VmiOutageScenarioPlugin(AbstractScenarioPlugin):
             while time.time() - start_time < timeout:
                 deleted_vmi = self.k8s_client.get_vmi(vm_name, namespace)
                 if deleted_vmi:
-                    if start_creation_time != deleted_vmi.get('metadata', {}).get('creationTimestamp'):
+                    if start_creation_time is not None and start_creation_time != deleted_vmi.get('metadata', {}).get('creationTimestamp'):
                         logging.info(f"VMI {vm_name} successfully recreated")
                         self.affected_vmi.vmi_rescheduling_time = time.time() - start_time
                         return 0
@@ -753,7 +767,7 @@ class VmiOutageScenarioPlugin(AbstractScenarioPlugin):
                 
                 try:
                     # Clean up server-generated fields
-                    vmi_dict = self.original_vmi.copy()
+                    vmi_dict = copy.deepcopy(self.original_vmi)
                     if 'metadata' in vmi_dict:
                         metadata = vmi_dict['metadata']
                         for field in ['resourceVersion', 'uid', 'creationTimestamp', 'generation']:
@@ -765,10 +779,10 @@ class VmiOutageScenarioPlugin(AbstractScenarioPlugin):
                     logging.info(f"Successfully recreated VMI {vm_name}")
                     
                     # Wait for VMI to start running
-                    self.wait_for_running(vm_name,namespace)
-                    
-                    logging.warning(f"VMI {vm_name} was recreated but didn't reach Running state in time")
-                    return 0  # Still consider it a success as the VMI was recreated
+                    if self.wait_for_running(vm_name, namespace) != 0:
+                        logging.warning(f"VMI {vm_name} was recreated but didn't reach Running state in time")
+                        return 1
+                    return 0
                     
                 except Exception as e:
                     logging.error(f"Error recreating VMI {vm_name}: {e}")

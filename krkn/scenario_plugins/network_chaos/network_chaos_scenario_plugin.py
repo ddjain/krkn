@@ -56,6 +56,22 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
                 test_image = get_yaml_item_value(
                     test_dict, "image", "quay.io/krkn-chaos/krkn-hub-multiarch:workload-krkn-tools"
                 )
+                if test_duration < 0:
+                    raise ValueError(
+                        "duration must not be negative, got %s" % test_duration
+                    )
+                if test_execution not in ("serial", "parallel"):
+                    raise ValueError(
+                        "execution must be 'serial' or 'parallel', got %s"
+                        % test_execution
+                    )
+                if not isinstance(test_egress, dict):
+                    raise ValueError("egress must be a mapping of parameter to value")
+                if not test_egress:
+                    raise ValueError("egress must define at least one parameter")
+                for key, value in test_egress.items():
+                    if value is None:
+                        raise ValueError("egress parameter %s has no value" % key)
                 if test_node:
                     node_name_list = test_node.split(",")
                     nodelst = common_node_functions.get_node_by_name(node_name_list, lib_telemetry.get_lib_kubernetes())
@@ -75,8 +91,14 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
                     lib_telemetry.get_lib_kubernetes(),
                     image=test_image
                 )
+                if not test_interface:
+                    raise RuntimeError("No network interface detected on the node")
                 joblst = []
                 egress_lst = [i for i in param_lst if i in test_egress]
+                if not egress_lst:
+                    raise ValueError(
+                        "egress must contain at least one of %s" % param_lst
+                    )
                 chaos_config = {
                     "network_chaos": {
                         "duration": test_duration,
@@ -95,18 +117,18 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
                 job_template = env.get_template("job.j2")
                 try:
                     for i in egress_lst:
-                        for node in nodelst:
+                        for node_index, node in enumerate(nodelst):
                             exec_cmd = self.get_egress_cmd(
                                 test_execution,
                                 test_interface,
                                 i,
-                                test_dict["egress"],
+                                test_egress,
                                 duration=test_duration,
                             )
                             logging.info("Executing %s on node %s" % (exec_cmd, node))
                             job_body = yaml.safe_load(
                                 job_template.render(
-                                    jobname=i + str(hash(node))[:5],
+                                    jobname="%s%s-%d" % (i, str(hash(node))[:5], node_index),
                                     nodename=node,
                                     cmd=exec_cmd,
                                     image=test_image
@@ -120,6 +142,7 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
                                 logging.error(
                                     "NetworkChaosScenarioPlugin Error creating job"
                                 )
+                                scenario_telemetry.exit_status = 1
                                 return 1
                         if test_execution == "serial":
                             logging.info("Waiting for serial job to finish")
@@ -142,6 +165,7 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
                     logging.error(
                         "NetworkChaosScenarioPlugin exiting due to Exception %s" % e
                     )
+                    scenario_telemetry.exit_status = 1
                     return 1
                 finally:
                     logging.info("Deleting jobs")
@@ -168,11 +192,11 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
             if test_interface == []:
                 cmd = "ip r | grep default | awk '/default/ {print $5}'"
                 output = kubecli.exec_cmd_in_pod(cmd, pod_name, "default")
-                test_interface = [output.replace("\n", "")]
+                test_interface = output.split()
             else:
                 cmd = "ip -br addr show|awk -v ORS=',' '{print $1}'"
                 output = kubecli.exec_cmd_in_pod(cmd, pod_name, "default")
-                interface_lst = output[:-1].split(",")
+                interface_lst = [i for i in output.strip().split(",") if i]
                 for interface in test_interface:
                     if interface not in interface_lst:
                         logging.error(
@@ -206,7 +230,7 @@ class NetworkChaosScenarioPlugin(AbstractScenarioPlugin):
         count = 0
         joblen = len(joblst)
         while count != joblen:
-            for jobname in joblst:
+            for jobname in joblst[:]:
                 try:
                     api_response = kubecli.get_job_status(jobname, namespace="default")
                     if (

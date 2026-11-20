@@ -25,27 +25,27 @@ def generate_rules(
     input_rules = []
     output_rules = []
     for interface in interfaces:
-        if config.ports:
-            for port in config.ports:
-                if config.egress:
-                    for protocol in set(config.protocols):
+        for protocol in set(config.protocols):
+            if config.ports:
+                for port in config.ports:
+                    if port == 0:
+                        # 0 is not a valid iptables --dport value
+                        continue
+                    if config.egress:
                         output_rules.append(
-                            f"iptables -I OUTPUT 1 -p {protocol} --dport {port} -m state --state NEW,RELATED,ESTABLISHED -j DROP"
+                            f"iptables -I OUTPUT 1 -o {interface} -p {protocol} --dport {port} -m state --state NEW,RELATED,ESTABLISHED -j DROP"
                         )
-                if config.ingress:
-                    for protocol in set(config.protocols):
+                    if config.ingress:
                         input_rules.append(
                             f"iptables -I INPUT 1 -i {interface} -p {protocol} --dport {port} -m state --state NEW,RELATED,ESTABLISHED -j DROP"
                         )
-        else:
-            # empty ports means block all traffic on all ports
-            if config.egress:
-                for protocol in set(config.protocols):
+            else:
+                # empty ports means block all traffic on all ports
+                if config.egress:
                     output_rules.append(
-                        f"iptables -I OUTPUT 1 -p {protocol} -m state --state NEW,RELATED,ESTABLISHED -j DROP"
+                        f"iptables -I OUTPUT 1 -o {interface} -p {protocol} -m state --state NEW,RELATED,ESTABLISHED -j DROP"
                     )
-            if config.ingress:
-                for protocol in set(config.protocols):
+                if config.ingress:
                     input_rules.append(
                         f"iptables -I INPUT 1 -i {interface} -p {protocol} -m state --state NEW,RELATED,ESTABLISHED -j DROP"
                     )
@@ -61,12 +61,33 @@ def apply_network_rules(
     parallel: bool,
     node_name: str,
 ):
-    for rule in input_rules:
-        log_info(f"applying iptables INPUT rule: {rule}", parallel, node_name)
-        kubecli.exec_cmd_in_pod([rule], pod_name, namespace)
-    for rule in output_rules:
-        log_info(f"applying iptables OUTPUT rule: {rule}", parallel, node_name)
-        kubecli.exec_cmd_in_pod([rule], pod_name, namespace)
+    applied_input = 0
+    applied_output = 0
+    try:
+        for rule in input_rules:
+            log_info(f"applying iptables INPUT rule: {rule}", parallel, node_name)
+            kubecli.exec_cmd_in_pod([rule], pod_name, namespace)
+            applied_input += 1
+        for rule in output_rules:
+            log_info(f"applying iptables OUTPUT rule: {rule}", parallel, node_name)
+            kubecli.exec_cmd_in_pod([rule], pod_name, namespace)
+            applied_output += 1
+    except Exception:
+        # roll back the rules already applied (inserted at the top, so the
+        # most recent one is always rule 1)
+        for chain, rules in (
+            ("OUTPUT", output_rules[:applied_output]),
+            ("INPUT", input_rules[:applied_input]),
+        ):
+            for rule in rules:
+                prefix = rule.split(" -- ", 1)[0] + " -- " if rule.startswith("nsenter ") else ""
+                try:
+                    kubecli.exec_cmd_in_pod(
+                        [f"{prefix}iptables -D {chain} 1"], pod_name, namespace
+                    )
+                except Exception as e:
+                    log_info(f"failed to roll back {chain} rule: {e}", parallel, node_name)
+        raise
 
 
 def clean_network_rules(

@@ -327,6 +327,36 @@ def _dedupe_alerts(alerts):
     return unique
 
 
+def _coerce_number(value):
+    """Return value as a finite int/float, or None if it is not numeric."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _coerce_bool(value):
+    """Interpret a pass/fail flag; string values such as 'false' are not truthy."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "fail", "failed")
+    return bool(value)
+
+
+def _normalize_phase(phase):
+    """Map phase spellings (None, 'PRE', 'post-chaos') onto pre/during/post."""
+    if not isinstance(phase, str) or not phase.strip():
+        return "during"
+    phase = phase.strip().lower()
+    if phase.endswith("-chaos"):
+        phase = phase[: -len("-chaos")]
+    return phase
+
+
 def build_chaos_report(chaos_output: dict) -> str:
     telemetry = chaos_output.get("telemetry", {})
     scenarios = telemetry.get("scenarios", [])
@@ -599,13 +629,13 @@ def build_chaos_report(chaos_output: dict) -> str:
         checks_by_phase = {}
         for check in object_state_checks:
             if isinstance(check, dict):
-                phase = check.get("phase", "during")
+                phase = _normalize_phase(check.get("phase"))
                 if phase not in checks_by_phase:
                     checks_by_phase[phase] = []
                 checks_by_phase[phase].append(check)
 
-        # Display in order: pre, during, post
-        for phase in ["pre", "during", "post"]:
+        # Display in order: pre, during, post, then any other phase
+        for phase in ["pre", "during", "post"] + [p for p in checks_by_phase if p not in ("pre", "during", "post")]:
             if phase in checks_by_phase:
                 phase_label = phase.upper()
                 lines.append(f"OBJECT STATE CHECKS ({phase_label})")
@@ -615,9 +645,9 @@ def build_chaos_report(chaos_output: dict) -> str:
                     namespace = check.get("namespace", "")
                     condition_type = check.get("condition_type", "")
                     condition_status = check.get("condition_status", "")
-                    passed = check.get("passed", False)
-                    objects_checked = check.get("objects_checked", 0)
-                    objects_failed = check.get("objects_failed", 0)
+                    passed = _coerce_bool(check.get("passed", False))
+                    objects_checked = _coerce_number(check.get("objects_checked")) or 0
+                    objects_failed = _coerce_number(check.get("objects_failed")) or 0
                     duration = check.get("duration")
                     message = check.get("message", "")
 
@@ -640,8 +670,9 @@ def build_chaos_report(chaos_output: dict) -> str:
                         extra.append(f"{objects_checked} checked")
                     if objects_failed > 0:
                         extra.append(f"{objects_failed} failed")
-                    if duration is not None and duration != "":
-                        extra.append(f"{float(duration):.2f}s")
+                    duration_value = _coerce_number(duration)
+                    if duration_value is not None:
+                        extra.append(f"{duration_value:.2f}s")
 
                     suffix = f" ({', '.join(extra)})" if extra else ""
                     lines.append(f"  {status_str:<6} {detail}{suffix}")
@@ -696,10 +727,13 @@ def build_chaos_report(chaos_output: dict) -> str:
 
     scenario_slo_details = chaos_output.get("scenario_slo_details", [])
     resiliency = telemetry.get("overall_resiliency_report", {})
-    total_slos = resiliency.get("total_slos", 0)
-    passed_slos = resiliency.get("passed_slos", 0)
-    failed_slos = total_slos - passed_slos
+    total_slos = resiliency.get("total_slos") or 0
+    passed_slos = resiliency.get("passed_slos") or 0
+    failed_slos = max(total_slos - passed_slos, 0)
     telemetry_alerts = telemetry.get("alerts") or []
+    if not isinstance(telemetry_alerts, (list, tuple)):
+        telemetry_alerts = []
+    telemetry_alerts = list(telemetry_alerts)
     critical_alerts_raw = chaos_output.get("critical_alerts") or {}
     chaos_alerts, post_chaos_alerts = _extract_critical_alerts(critical_alerts_raw)
     legacy_alerts = [
@@ -741,7 +775,7 @@ def build_chaos_report(chaos_output: dict) -> str:
                 name = getattr(alert, "name", "N/A")
                 severity = getattr(alert, "severity", "N/A")
                 phase = getattr(alert, "phase", "N/A")
-            if status is False:
+            if isinstance(status, (int, float)) and not status:
                 validation_failures.append((name, severity, phase))
         lines.append("  SLO Validation Failures")
         if validation_failures:
@@ -784,7 +818,7 @@ def build_chaos_report(chaos_output: dict) -> str:
 
     if scenario_slo_details:
         failed_entries = [
-            (entry["scenario"], [s for s in entry.get("slo_details", []) if not s["passed"]])
+            (entry.get("scenario", "N/A"), [s for s in entry.get("slo_details", []) if not s.get("passed")])
             for entry in scenario_slo_details
         ]
         failed_entries = [(name, failed) for name, failed in failed_entries if failed]
@@ -794,14 +828,15 @@ def build_chaos_report(chaos_output: dict) -> str:
             for scenario, failed in failed_entries:
                 lines.append(f"    Scenario: {scenario}")
                 for slo in failed:
-                    lines.append(f"      FAIL  [{slo.get('severity', 'unknown'):<8}]  {slo['name']}")
+                    lines.append(f"      FAIL  [{slo.get('severity', 'unknown'):<8}]  {slo.get('name', 'N/A')}")
 
     # Extract weights from detailed report
     weight_map = {}
     scenario_details = chaos_output.get("resiliency_report", {}).get("scenarios", [])
     if scenario_details:
         for scenario_report in scenario_details:
-            weight_map[scenario_report.get("name")] = scenario_report.get("weight", 1)
+            weight = _coerce_number(scenario_report.get("weight"))
+            weight_map[scenario_report.get("name")] = 1 if weight is None or weight < 0 else weight
 
     per_scenario_scores = resiliency.get("scenarios", {})
     for scenario_name, score in per_scenario_scores.items():
@@ -810,10 +845,16 @@ def build_chaos_report(chaos_output: dict) -> str:
 
     # Calculate and display weighted average explanation
     if weight_map and per_scenario_scores:
-        total_weight = sum(weight_map.get(name, 1) for name in per_scenario_scores.keys())
-        weighted_sum = sum(per_scenario_scores.get(name, 0) * weight_map.get(name, 1) for name in per_scenario_scores.keys())
-        weighted_avg = int(weighted_sum / total_weight) if total_weight > 0 else 0
-        lines.append(f"  Calculation: ({' + '.join(f'{score}×{weight_map.get(name, 1)}' for name, score in per_scenario_scores.items())}) ÷ {total_weight} = {weighted_avg}")
+        numeric_scores = {}
+        for name, score in per_scenario_scores.items():
+            number = _coerce_number(score)
+            if number is not None:
+                numeric_scores[name] = number
+        total_weight = sum(weight_map.get(name, 1) for name in numeric_scores)
+        if total_weight > 0:
+            weighted_sum = sum(score * weight_map.get(name, 1) for name, score in numeric_scores.items())
+            weighted_avg = int(weighted_sum / total_weight)
+            lines.append(f"  Calculation: ({' + '.join(f'{score}×{weight_map.get(name, 1)}' for name, score in numeric_scores.items())}) ÷ {total_weight} = {weighted_avg}")
 
     overall_score = resiliency.get("resiliency_score", "N/A")
     lines.append(f"  Overall Score                : {overall_score} / 100")
@@ -824,7 +865,7 @@ def build_chaos_report(chaos_output: dict) -> str:
 
 def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
     telemetry = chaos_output.get("telemetry", {})
-    scenarios_raw = telemetry.get("scenarios", [])
+    scenarios_raw = [s for s in telemetry.get("scenarios", []) if isinstance(s, dict)]
 
     starts = [s["start_timestamp"] for s in scenarios_raw if s.get("start_timestamp")]
     ends = [s["end_timestamp"] for s in scenarios_raw if s.get("end_timestamp")]
@@ -839,10 +880,11 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
         }
         ns_list = [namespace for namespace in ns_list if namespace not in target_namespaces]
 
-        recovered = s.get("affected_pods", {}).get("recovered", [])
-        unrecovered = s.get("affected_pods", {}).get("unrecovered", [])
+        affected_pods = s.get("affected_pods") or {}
+        recovered = affected_pods.get("recovered", [])
+        unrecovered = affected_pods.get("unrecovered", [])
         all_pods = [_extract_pod_name(p) for p in unrecovered + recovered]
-        pods_error = s.get("affected_pods", {}).get("error")
+        pods_error = affected_pods.get("error")
 
         pod_recovery_times = [
             p.get("total_recovery_time")
@@ -858,10 +900,11 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
             reschedule = None
             readiness = None
 
-        vmi_recovered = s.get("affected_vmis", {}).get("recovered", [])
-        vmi_unrecovered = s.get("affected_vmis", {}).get("unrecovered", [])
+        affected_vmis = s.get("affected_vmis") or {}
+        vmi_recovered = affected_vmis.get("recovered", [])
+        vmi_unrecovered = affected_vmis.get("unrecovered", [])
         all_vmis = [_extract_vmi_name(v) for v in vmi_unrecovered + vmi_recovered]
-        vmis_error = s.get("affected_vmis", {}).get("error")
+        vmis_error = affected_vmis.get("error")
 
         vmi_recovery_times = [
             v.get("total_recovery_time")
@@ -884,7 +927,7 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
             vmi_readiness = None
             vmi_guest_reachable = None
 
-        affected_nodes = s.get("affected_nodes", [])
+        affected_nodes = s.get("affected_nodes") or []
         node_list = []
         for node in affected_nodes:
             if isinstance(node, dict):
@@ -918,6 +961,8 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
 
         # Additional telemetry (HTTP load test metrics)
         additional_telemetry = s.get("additional_telemetry")
+        if not isinstance(additional_telemetry, dict):
+            additional_telemetry = None
 
         scenarios.append({
             "scenario": s.get("scenario", "N/A"),
@@ -1023,12 +1068,9 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
         rows = []
         for ni in node_infos:
             rows.append([
-                ni.get("nodes_type", "N/A"),
-                str(ni.get("count", "N/A")),
-                ni.get("instance_type", "N/A"),
-                ni.get("architecture", "N/A"),
-                ni.get("kubelet_version", "N/A"),
-                ni.get("os_version", "N/A"),
+                "N/A" if ni.get(key) is None else str(ni[key])
+                for key in ("nodes_type", "count", "instance_type",
+                            "architecture", "kubelet_version", "os_version")
             ])
         f.extend(_make_data_table(
             ["Type", "Count", "Instance", "Architecture", "Kubelet", "OS"], rows,
@@ -1244,7 +1286,10 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
                     status_code = str(check.get("status_code", ""))
                     duration = ""
                     if check.get("duration") is not None and check.get("duration") != "":
-                        duration = f"{float(check['duration']):.2f}s"
+                        try:
+                            duration = f"{float(check['duration']):.2f}s"
+                        except (TypeError, ValueError):
+                            duration = str(check["duration"])
                     passed = check.get("status") or check.get("passed")
                     rows.append([url, status_code, duration, _badge("PASS" if passed else "FAIL", bool(passed))])
                 f.extend(_make_data_table(
@@ -1275,7 +1320,7 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
                     namespace = check.get("namespace", "")
                     condition = f"{check.get('condition_type', '')}={check.get('condition_status', '')}"
                     objects_checked = check.get("objects_checked", 0)
-                    objects_failed = check.get("objects_failed", 0)
+                    objects_failed = check.get("objects_failed") or 0
                     duration = ""
                     if check.get("duration") is not None and check.get("duration") != "":
                         duration = f"{float(check['duration']):.2f}s"
@@ -1435,7 +1480,7 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
 
     failed_entries = []
     for entry in scenario_slo_details:
-        failed = [s for s in entry.get("slo_details", []) if not s["passed"]]
+        failed = [s for s in entry.get("slo_details", []) if not s.get("passed")]
         if failed:
             failed_entries.append((entry["scenario"], failed))
     if failed_entries:
@@ -1453,7 +1498,8 @@ def build_chaos_report_pdf(chaos_output: dict, output_path: str) -> str:
     scenario_details = chaos_output.get("resiliency_report", {}).get("scenarios", [])
     if scenario_details:
         for scenario_report in scenario_details:
-            weight_map[scenario_report.get("name")] = scenario_report.get("weight", 1)
+            weight = scenario_report.get("weight")
+            weight_map[scenario_report.get("name")] = 1 if weight is None else weight
 
     # Build scenario scores table with weights
     if per_scenario_scores:

@@ -92,7 +92,11 @@ class Docker:
                 try:
                     version_info = self.client.version()
                     version_str = version_info.get('Version', '')
-                    if 'podman' in version_str.lower():
+                    components = ' '.join(
+                        str(c.get('Name', '')) for c in (version_info.get('Components') or [])
+                        if isinstance(c, dict)
+                    )
+                    if 'podman' in version_str.lower() or 'podman' in components.lower():
                         self.runtime = 'podman'
                     else:
                         self.runtime = 'docker'
@@ -239,9 +243,11 @@ class docker_node_scenarios(abstract_node_scenarios):
     # Node scenario to terminate the node
     def node_termination_scenario(self, instance_kill_count, node, timeout, poll_interval):
         for _ in range(instance_kill_count):
+            affected_node = AffectedNode(node)
             try:
                 logging.info("Starting node_termination_scenario injection")
                 container_id = self.docker.get_container_id(node)
+                affected_node.node_id = container_id
                 logging.info(
                     "Terminating the node %s with container ID: %s "
                     % (node, container_id)
@@ -258,6 +264,7 @@ class docker_node_scenarios(abstract_node_scenarios):
                 )
                 logging.error("node_termination_scenario injection failed!")
                 raise e
+            self.affected_nodes_status.affected_nodes.append(affected_node)
 
     # Node scenario to reboot the node
     def node_reboot_scenario(self, instance_kill_count, node, timeout, soft_reboot=False):
@@ -266,6 +273,7 @@ class docker_node_scenarios(abstract_node_scenarios):
             try:
                 logging.info("Starting node_reboot_scenario injection")
                 container_id = self.docker.get_container_id(node)
+                affected_node.node_id = container_id
                 logging.info(
                     "Rebooting the node %s with container ID: %s "
                     % (node, container_id)

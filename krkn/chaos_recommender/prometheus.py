@@ -13,12 +13,21 @@
 # limitations under the License.
 import logging
 
+import requests
 from prometheus_api_client import PrometheusConnect
 import pandas as pd
 import urllib3
 
 
 saved_metrics_path = "./utilisation.txt"
+
+
+class PrometheusConnectionError(Exception):
+    """Raised when the Prometheus endpoint cannot be reached."""
+
+
+class PrometheusQueryError(Exception):
+    """Raised when a Prometheus query fails."""
 
 
 def convert_data_to_dataframe(data, label):
@@ -46,15 +55,17 @@ def convert_data_limits(data, node_data, service, prometheus):
         pod_name = entry["metric"]["pod"]
         value = entry["value"][1]
         result[pod_name] = value
-    return result.get(
-        service, get_node_capacity(node_data, service, prometheus)
-    )  # for those pods whose limits are not defined they can take as much resources, there assigning a very high value
+    if service in result:
+        return result[service]
+    # for those pods whose limits are not defined they can take as much resources, there assigning a very high value
+    return get_node_capacity(node_data, service, prometheus)
 
 
 def get_node_capacity(node_data, pod_name, prometheus):
 
     # Get the node name on which the pod is running
-    query = f'kube_pod_info{{pod="{pod_name}"}}'
+    escaped_pod_name = pod_name.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    query = f'kube_pod_info{{pod="{escaped_pod_name}"}}'
     result = prometheus.custom_query(query)
     if not result:
         return None
@@ -97,11 +108,17 @@ def save_utilization_to_file(utilization, filename, prometheus):
                     "service": s,
                     "CPU": convert_data(utilization_data[0], s),
                     "CPU_LIMITS": convert_data_limits(
-                        utilization_data[1], utilization_data[5], s, prometheus
+                        utilization_data[1],
+                        utilization_data[5] if len(utilization_data) > 5 else [],
+                        s,
+                        prometheus,
                     ),
                     "MEM": convert_data(utilization_data[2], s),
                     "MEM_LIMITS": convert_data_limits(
-                        utilization_data[3], utilization_data[6], s, prometheus
+                        utilization_data[3],
+                        utilization_data[6] if len(utilization_data) > 6 else [],
+                        s,
+                        prometheus,
                     ),
                     "NETWORK": convert_data(utilization_data[4], s),
                 },
@@ -126,15 +143,27 @@ def save_utilization_to_file(utilization, filename, prometheus):
     merged_df.to_csv(filename, sep="\t", index=False)
 
 
+def _custom_query(prometheus, query):
+    try:
+        return prometheus.custom_query(query)
+    except requests.exceptions.ConnectionError as e:
+        raise PrometheusConnectionError(str(e)) from e
+    except Exception as e:
+        raise PrometheusQueryError(str(e)) from e
+
+
 def fetch_utilization_from_prometheus(
     prometheus_endpoint, auth_token, namespaces, scrape_duration
 ):
     urllib3.disable_warnings()
-    prometheus = PrometheusConnect(
-        url=prometheus_endpoint,
-        headers={"Authorization": "Bearer {}".format(auth_token)},
-        disable_ssl=True,
-    )
+    try:
+        prometheus = PrometheusConnect(
+            url=prometheus_endpoint,
+            headers={"Authorization": "Bearer {}".format(auth_token)},
+            disable_ssl=True,
+        )
+    except Exception as e:
+        raise PrometheusConnectionError(str(e)) from e
 
     # Dicts for saving utilisation and queries -- key is namespace
     utilization = {}
@@ -148,42 +177,42 @@ def fetch_utilization_from_prometheus(
             'sum (rate (container_cpu_usage_seconds_total{image!="", namespace="%s"}[%s])) by (pod) *1000'
             % (namespace, scrape_duration)
         )
-        cpu_result = prometheus.custom_query(cpu_query)
+        cpu_result = _custom_query(prometheus, cpu_query)
 
         cpu_limits_query = (
             '(sum by (pod) (kube_pod_container_resource_limits{resource="cpu", namespace="%s"}))*1000'
             % (namespace)
         )
-        cpu_limits_result = prometheus.custom_query(cpu_limits_query)
+        cpu_limits_result = _custom_query(prometheus, cpu_limits_query)
 
         node_cpu_limits_query = (
             'kube_node_status_capacity{resource="cpu", unit="core"}*1000'
         )
-        node_cpu_limits_result = prometheus.custom_query(node_cpu_limits_query)
+        node_cpu_limits_result = _custom_query(prometheus, node_cpu_limits_query)
 
         mem_query = (
             'sum by (pod) (avg_over_time(container_memory_usage_bytes{image!="", namespace="%s"}[%s]))'
             % (namespace, scrape_duration)
         )
-        mem_result = prometheus.custom_query(mem_query)
+        mem_result = _custom_query(prometheus, mem_query)
 
         mem_limits_query = (
             'sum by (pod) (kube_pod_container_resource_limits{resource="memory", namespace="%s"})  '
             % (namespace)
         )
-        mem_limits_result = prometheus.custom_query(mem_limits_query)
+        mem_limits_result = _custom_query(prometheus, mem_limits_query)
 
         node_mem_limits_query = (
             'kube_node_status_capacity{resource="memory", unit="byte"}'
         )
-        node_mem_limits_result = prometheus.custom_query(node_mem_limits_query)
+        node_mem_limits_result = _custom_query(prometheus, node_mem_limits_query)
 
         network_query = (
             'sum by (pod) ((avg_over_time(container_network_transmit_bytes_total{namespace="%s"}[%s])) + \
         (avg_over_time(container_network_receive_bytes_total{namespace="%s"}[%s])))'
             % (namespace, scrape_duration, namespace, scrape_duration)
         )
-        network_result = prometheus.custom_query(network_query)
+        network_result = _custom_query(prometheus, network_query)
 
         utilization[namespace] = [
             cpu_result,

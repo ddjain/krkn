@@ -10,8 +10,10 @@ Assisted By: Claude Code
 """
 
 import os
+import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from reportlab.platypus import Table
 
@@ -24,6 +26,12 @@ from krkn.summarized_reports.transform import (
     _extract_pod_name,
     _extract_vmi_name,
     _extract_critical_alerts,
+    _FAIL_RED,
+    _PASS_GREEN,
+    _TEXT_COLOR,
+    _WARN_YELLOW,
+    _make_kv_table,
+    _score_color,
 )
 
 
@@ -1084,6 +1092,400 @@ class TestBuildChaosReportPdf(unittest.TestCase):
         finally:
             if os.path.exists(pdf_path):
                 os.unlink(pdf_path)
+
+
+class TestScoreColor(unittest.TestCase):
+
+    def test_score_90_and_above_is_green(self):
+        self.assertIs(_score_color(90), _PASS_GREEN)
+        self.assertIs(_score_color(100.5), _PASS_GREEN)
+
+    def test_score_between_70_and_90_is_yellow(self):
+        self.assertIs(_score_color(89.99), _WARN_YELLOW)
+        self.assertIs(_score_color(70), _WARN_YELLOW)
+
+    def test_score_below_70_is_red(self):
+        self.assertIs(_score_color(69.9), _FAIL_RED)
+        self.assertIs(_score_color(-5), _FAIL_RED)
+
+    def test_non_numeric_score_uses_text_color(self):
+        self.assertIs(_score_color("95"), _TEXT_COLOR)
+        self.assertIs(_score_color(None), _TEXT_COLOR)
+
+    def test_bool_true_takes_numeric_branch_as_red(self):
+        # bool is a subclass of int: True == 1 falls through to the red branch.
+        self.assertIs(_score_color(True), _FAIL_RED)
+
+
+class TestMakeKvTable(unittest.TestCase):
+
+    def test_empty_rows_returns_empty_list(self):
+        self.assertEqual(_make_kv_table([]), [])
+
+
+class TestBuildChaosReportObjectStateChecks(unittest.TestCase):
+
+    def test_during_pass_all_fields(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "kind": "Pod", "namespace": "ns",
+            "condition_type": "Ready", "condition_status": True,
+            "passed": True, "objects_checked": 2, "objects_failed": 0,
+            "duration": 1.5,
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("OBJECT STATE CHECKS (DURING)", report)
+        self.assertIn("PASS   c kind=Pod ns=ns Ready=True (2 checked, 1.50s)", report)
+        self.assertNotIn("Failed:", report)
+
+    def test_failed_check_shows_message(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": False, "message": "pod bad",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c", report)
+        self.assertIn("Failed: pod bad", report)
+
+    def test_failed_check_sentinel_message_omitted(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": False, "message": "All objects passed",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c", report)
+        self.assertNotIn("Failed:", report)
+
+    def test_missing_phase_grouped_with_explicit_during(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [
+            {"check_name": "c", "passed": True},
+            {"check_name": "d", "phase": "during", "passed": True},
+        ]
+        report = build_chaos_report(output)
+        self.assertIn("OBJECT STATE CHECKS (DURING)", report)
+        self.assertIn("PASS   c", report)
+        self.assertIn("PASS   d", report)
+
+    def test_failed_check_with_phase_none_surfaced(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [
+            {"check_name": "c", "phase": None, "passed": False, "message": "pod bad"},
+        ]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c", report)
+
+    def test_failed_check_with_phase_PRE_surfaced(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [
+            {"check_name": "c", "phase": "PRE", "passed": False, "message": "pod bad"},
+        ]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c", report)
+
+    def test_failed_check_with_phase_post_chaos_surfaced(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [
+            {"check_name": "c", "phase": "post-chaos", "passed": False, "message": "pod bad"},
+        ]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c", report)
+
+    def test_non_dict_entries_skipped(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [
+            ["raw"],
+            {"check_name": "c", "passed": True},
+        ]
+        report = build_chaos_report(output)
+        self.assertIn("PASS   c", report)
+        self.assertNotIn("raw", report)
+
+    def test_empty_check_dict_renders_unnamed_fail(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{}]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   unnamed", report)
+        self.assertNotIn("unnamed (", report)
+
+    def test_zero_counts_and_no_duration_omit_suffix(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": True,
+            "objects_checked": 0, "objects_failed": 0, "duration": None,
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("PASS   c\n", report)
+
+    def test_empty_string_duration_skipped(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": True, "objects_checked": 1,
+            "duration": "",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("(1 checked)", report)
+        self.assertNotIn(".00s", report)
+
+    def test_failed_check_counts_objects_in_suffix(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": False, "objects_checked": 3,
+            "objects_failed": 2, "message": "pod bad",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c (3 checked, 2 failed)", report)
+
+    def test_truthy_string_passed_renders_fail(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": "false",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL   c", report)
+
+    def test_string_objects_failed_counted(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": False, "objects_failed": "3",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("3 failed", report)
+
+    def test_unparseable_duration_renders_check(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["object_state_checks"] = [{
+            "check_name": "c", "passed": True, "duration": "abc",
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("PASS   c", report)
+
+
+class TestBuildChaosReportSloValidation(unittest.TestCase):
+
+    def test_non_dict_failing_alert_listed(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = [
+            SimpleNamespace(status=False, name="a", severity="critical", phase="during")
+        ]
+        report = build_chaos_report(output)
+        self.assertIn("SLO Validation Failures", report)
+        self.assertIn("FAIL  [critical] a (phase=during)", report)
+
+    def test_non_dict_alert_without_attrs_defaults_to_none(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = [SimpleNamespace()]
+        report = build_chaos_report(output)
+        self.assertIn("SLO Validation Failures", report)
+        lines = report.splitlines()
+        self.assertEqual(lines[lines.index("  SLO Validation Failures") + 1], "    None")
+        self.assertNotIn("FAIL  [", report)
+
+    def test_all_dict_alerts_pass_renders_none(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = [{"status": True, "name": "ok"}]
+        report = build_chaos_report(output)
+        self.assertIn("SLO Validation Failures", report)
+        lines = report.splitlines()
+        self.assertEqual(lines[lines.index("  SLO Validation Failures") + 1], "    None")
+        self.assertNotIn("FAIL  [", report)
+
+    def test_status_zero_counted_as_failure(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = [{
+            "name": "z", "severity": "critical", "phase": "post", "status": 0,
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("FAIL  [critical] z (phase=post)", report)
+
+    def test_alertstate_fallback_not_counted_as_failure(self):
+        # Characterization: the alertstate fallback can never trigger a failure:
+        # status is compared with "is False" and alertstate is always a string.
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = [{"name": "f", "alertstate": "firing"}]
+        report = build_chaos_report(output)
+        self.assertIn("SLO Validation Failures", report)
+        lines = report.splitlines()
+        self.assertEqual(lines[lines.index("  SLO Validation Failures") + 1], "    None")
+
+    def test_dict_shaped_alerts_do_not_crash(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = {"a": 1}
+        report = build_chaos_report(output)
+        self.assertIn("ALERTS & SLOs", report)
+
+
+class TestBuildChaosReportPrometheusAlerts(unittest.TestCase):
+
+    def _with_telemetry_alerts(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["alerts"] = [{"status": True, "name": "ok"}]
+        return output
+
+    def test_both_sources_rendered(self):
+        output = self._with_telemetry_alerts()
+        output["critical_alerts"] = {
+            "chaos_alerts": [{"alertname": "EtcdDown", "severity": "critical",
+                              "alertstate": "firing"}],
+            "post_chaos_alerts": [{"alertname": "PostDown", "severity": "warning",
+                                   "alertstate": "firing"}],
+        }
+        report = build_chaos_report(output)
+        self.assertIn("Critical Prometheus Alerts", report)
+        self.assertIn("- EtcdDown [critical] state=firing phase=during", report)
+        self.assertIn("- PostDown [warning] state=firing phase=post", report)
+
+    def test_name_key_fallback_with_defaults(self):
+        output = self._with_telemetry_alerts()
+        output["critical_alerts"] = {"chaos_alerts": [{"name": "NamedAlert"}]}
+        report = build_chaos_report(output)
+        self.assertIn("- NamedAlert [N/A] state=N/A phase=during", report)
+
+    def test_non_dict_alert_object_getattr_path(self):
+        output = self._with_telemetry_alerts()
+        output["critical_alerts"] = {"chaos_alerts": [SimpleNamespace(name="x")]}
+        report = build_chaos_report(output)
+        self.assertIn("- x [N/A] state=N/A phase=N/A", report)
+
+    def test_list_format_critical_alerts_treated_as_chaos_phase(self):
+        output = self._with_telemetry_alerts()
+        output["critical_alerts"] = [{"alertname": "L", "severity": "critical",
+                                      "alertstate": "firing"}]
+        report = build_chaos_report(output)
+        self.assertIn("Critical Prometheus Alerts", report)
+        self.assertIn("- L [critical] state=firing phase=during", report)
+        self.assertNotIn("phase=post", report)
+
+
+class TestBuildChaosReportWeightedScoring(unittest.TestCase):
+
+    def test_weighted_average_happy_path(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [{"name": "s1", "weight": 2}]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": 100}
+        report = build_chaos_report(output)
+        self.assertIn("100 / 100 (weight: 2x)", report)
+        self.assertIn("Calculation: (100×2) ÷ 2 = 100", report)
+
+    def test_mixed_sign_weights_stay_within_100(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [
+            {"name": "a", "weight": 2}, {"name": "b", "weight": -1},
+        ]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {
+            "a": 100, "b": 50,
+        }
+        report = build_chaos_report(output)
+        match = re.search(r"÷ -?\d+ = (-?\d+)", report)
+        self.assertIsNotNone(match)
+        self.assertLessEqual(int(match.group(1)), 100)
+
+    def test_weighted_average_truncates(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [
+            {"name": "a", "weight": 1}, {"name": "b", "weight": 1},
+        ]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {
+            "a": 100, "b": 99,
+        }
+        report = build_chaos_report(output)
+        self.assertIn("÷ 2 = 99", report)
+
+    def test_weight_of_unscored_scenario_ignored_in_divisor(self):
+        # Characterization: total_weight sums weights of scored scenarios only,
+        # so a weight declared for a scenario without a score is dropped.
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [
+            {"name": "s1", "weight": 1}, {"name": "extra", "weight": 5},
+        ]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": 100}
+        report = build_chaos_report(output)
+        self.assertIn("Calculation: (100×1) ÷ 1 = 100", report)
+
+    def test_none_weight_treated_as_one(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [{"name": "s1", "weight": None}]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": 100}
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
+
+    def test_string_weight_coerced(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [{"name": "s1", "weight": "2"}]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": 100}
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
+
+    def test_zero_total_weight_omits_calculation(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [{"name": "s1", "weight": 0}]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": 50}
+        report = build_chaos_report(output)
+        self.assertNotIn("÷ 0", report)
+
+    def test_none_score_renders_report(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [{"name": "s1", "weight": 1}]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": None}
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
+
+    def test_string_score_renders_report(self):
+        output = _minimal_chaos_output()
+        output["resiliency_report"] = {"scenarios": [{"name": "s1", "weight": 1}]}
+        output["telemetry"]["overall_resiliency_report"]["scenarios"] = {"s1": "90"}
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
+
+
+class TestBuildChaosReportSloCounting(unittest.TestCase):
+
+    def test_passed_exceeding_total_clamped_to_zero(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["overall_resiliency_report"] = {
+            "total_slos": 2, "passed_slos": 5,
+            "resiliency_score": 100, "scenarios": {},
+        }
+        report = build_chaos_report(output)
+        self.assertIn("Resiliency SLOs Failed     : 0", report)
+
+    def test_total_slos_none_renders_report(self):
+        output = _minimal_chaos_output()
+        output["telemetry"]["overall_resiliency_report"] = {
+            "total_slos": None, "passed_slos": 0,
+            "resiliency_score": 100, "scenarios": {},
+        }
+        report = build_chaos_report(output)
+        self.assertIn("RESILIENCY SCORE", report)
+
+
+class TestBuildChaosReportPartialSloDetails(unittest.TestCase):
+
+    def test_entry_missing_scenario_key_renders_report(self):
+        output = _minimal_chaos_output()
+        output["scenario_slo_details"] = [{
+            "slo_details": [{"name": "x", "severity": "warning", "passed": False}],
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
+
+    def test_slo_missing_passed_key_renders_report(self):
+        output = _minimal_chaos_output()
+        output["scenario_slo_details"] = [{
+            "scenario": "s1",
+            "slo_details": [{"name": "x", "severity": "warning"}],
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
+
+    def test_failed_slo_missing_name_key_renders_report(self):
+        output = _minimal_chaos_output()
+        output["scenario_slo_details"] = [{
+            "scenario": "s1",
+            "slo_details": [{"severity": "warning", "passed": False}],
+        }]
+        report = build_chaos_report(output)
+        self.assertIn("Overall Score", report)
 
 
 if __name__ == "__main__":
